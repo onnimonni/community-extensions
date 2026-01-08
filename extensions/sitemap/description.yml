@@ -12,16 +12,22 @@ extension:
 
 repo:
   github: midwork-finds-jobs/duckdb-sitemap
-  ref: 6cd72d65fa3ee544cc25bac574094a8c4faeeb4d
+  ref: 3ae006d1da3ddeb87e3aeacb8fe34b0e98b1ee4f
 
 docs:
   hello_world: |
     -- Get all URLs from a sitemap (auto-prepends https://)
     SELECT * FROM sitemap_urls('example.com');
 
+    -- Get URLs from multiple sites
+    SELECT * FROM sitemap_urls(['example.com', 'google.com']);
+
     -- Filter specific URLs
     SELECT * FROM sitemap_urls('example.com')
     WHERE url LIKE '%/blog/%';
+
+    -- Ignore errors for invalid domains
+    SELECT * FROM sitemap_urls(['valid.com', 'invalid.com'], ignore_errors := true);
 
     -- Count URLs by type
     SELECT
@@ -59,6 +65,7 @@ docs:
     - max_retries (INTEGER): Max retry attempts (default: 5)
     - backoff_ms (INTEGER): Initial backoff in ms (default: 100)
     - max_backoff_ms (INTEGER): Max backoff cap in ms (default: 30000)
+    - ignore_errors (BOOLEAN): Don't throw on failed fetches (default: false)
 
     Example with options:
     ```sql
