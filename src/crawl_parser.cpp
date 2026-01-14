@@ -28,6 +28,9 @@ unique_ptr<ParserExtensionParseData> CrawlParseData::Copy() const {
 	copy->update_stale = update_stale;
 	copy->max_retry_backoff_seconds = max_retry_backoff_seconds;
 	copy->max_parallel_per_domain = max_parallel_per_domain;
+	copy->max_total_connections = max_total_connections;
+	copy->max_response_bytes = max_response_bytes;
+	copy->compress = compress;
 	return copy;
 }
 
@@ -166,6 +169,12 @@ static bool ParseWithOptions(const string &options_str, CrawlParseData &data) {
 			data.max_retry_backoff_seconds = std::stoi(value);
 		} else if (key == "max_parallel_per_domain") {
 			data.max_parallel_per_domain = std::stoi(value);
+		} else if (key == "max_total_connections") {
+			data.max_total_connections = std::stoi(value);
+		} else if (key == "max_response_bytes") {
+			data.max_response_bytes = std::stoll(value);
+		} else if (key == "compress") {
+			data.compress = (StringUtil::Lower(value) == "true" || value == "1");
 		}
 	}
 
@@ -348,6 +357,9 @@ ParserExtensionPlanResult CrawlParserExtension::PlanCrawl(ParserExtensionInfo *i
 	result.parameters.push_back(Value(data.update_stale));
 	result.parameters.push_back(Value(data.max_retry_backoff_seconds));
 	result.parameters.push_back(Value(data.max_parallel_per_domain));
+	result.parameters.push_back(Value(data.max_total_connections));
+	result.parameters.push_back(Value(data.max_response_bytes));
+	result.parameters.push_back(Value(data.compress));
 
 	result.requires_valid_transaction = true;
 	result.return_type = StatementReturnType::CHANGED_ROWS;

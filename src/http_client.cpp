@@ -37,7 +37,8 @@ int HttpClient::ParseRetryAfter(const std::string &retry_after) {
 	}
 }
 
-HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string &url, const std::string &user_agent) {
+HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string &url,
+                                         const std::string &user_agent, bool compress) {
 	HttpResponse response;
 
 	Connection conn(db);
@@ -52,23 +53,36 @@ HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string 
 	// Escape URL for SQL
 	std::string escaped_url = StringUtil::Replace(url, "'", "''");
 
-	// Build query - request headers to get Retry-After and Date
-	std::string query;
-	if (!user_agent.empty()) {
+	// Build headers map
+	std::string headers_map;
+	if (!user_agent.empty() && compress) {
 		std::string escaped_ua = StringUtil::Replace(user_agent, "'", "''");
+		headers_map = "{'User-Agent': '" + escaped_ua + "', 'Accept-Encoding': 'gzip, deflate'}";
+	} else if (!user_agent.empty()) {
+		std::string escaped_ua = StringUtil::Replace(user_agent, "'", "''");
+		headers_map = "{'User-Agent': '" + escaped_ua + "'}";
+	} else if (compress) {
+		headers_map = "{'Accept-Encoding': 'gzip, deflate'}";
+	}
+
+	// Build query - request headers to get Retry-After, Date, and Content-Length
+	std::string query;
+	if (!headers_map.empty()) {
 		query = StringUtil::Format(
 		    "SELECT status, decode(body) AS body, "
 		    "content_type, "
 		    "headers['retry-after'] AS retry_after, "
-		    "headers['Date'] AS server_date"
-		    "FROM http_get('%s', headers := {'User-Agent': '%s'})",
-		    escaped_url, escaped_ua);
+		    "headers['Date'] AS server_date, "
+		    "headers['content-length'] AS content_length "
+		    "FROM http_get('%s', headers := %s)",
+		    escaped_url, headers_map);
 	} else {
 		query = StringUtil::Format(
 		    "SELECT status, decode(body) AS body, "
 		    "content_type, "
 		    "headers['retry-after'] AS retry_after, "
-		    "headers['Date'] AS server_date"
+		    "headers['Date'] AS server_date, "
+		    "headers['content-length'] AS content_length "
 		    "FROM http_get('%s')",
 		    escaped_url);
 	}
@@ -108,16 +122,26 @@ HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string 
 	auto date_val = chunk->GetValue(4, 0);
 	response.server_date = date_val.IsNull() ? "" : date_val.GetValue<std::string>();
 
+	// Get content-length
+	auto cl_val = chunk->GetValue(5, 0);
+	if (!cl_val.IsNull()) {
+		try {
+			response.content_length = std::stoll(cl_val.GetValue<std::string>());
+		} catch (...) {
+			response.content_length = -1;
+		}
+	}
+
 	response.success = (response.status_code >= 200 && response.status_code < 300);
 	return response;
 }
 
 HttpResponse HttpClient::Fetch(ClientContext &context, const std::string &url, const RetryConfig &config,
-                               const std::string &user_agent) {
+                               const std::string &user_agent, bool compress) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 
 	// Single attempt - crawler handles all retries with Fibonacci backoff
-	return ExecuteHttpGet(db, url, user_agent);
+	return ExecuteHttpGet(db, url, user_agent, compress);
 }
 
 } // namespace duckdb

@@ -13,6 +13,7 @@ struct HttpResponse {
 	std::string retry_after;
 	std::string server_date;  // Date header from server
 	std::string error;
+	int64_t content_length = -1;  // -1 if unknown
 	bool success = false;
 };
 
@@ -26,11 +27,12 @@ struct RetryConfig {
 class HttpClient {
 public:
 	static HttpResponse Fetch(ClientContext &context, const std::string &url, const RetryConfig &config,
-	                          const std::string &user_agent = "");
+	                          const std::string &user_agent = "", bool compress = true);
 	static int ParseRetryAfter(const std::string &retry_after);
 
 private:
-	static HttpResponse ExecuteHttpGet(DatabaseInstance &db, const std::string &url, const std::string &user_agent);
+	static HttpResponse ExecuteHttpGet(DatabaseInstance &db, const std::string &url,
+	                                    const std::string &user_agent, bool compress);
 	static bool IsRetryable(int status_code);
 };
 

@@ -34,6 +34,11 @@ struct CrawlParseData : public ParserExtensionParseData {
 	// Rate limiting and retry options
 	int max_retry_backoff_seconds = 600;  // Max Fibonacci backoff for 429/5XX/timeout (10 min default)
 	int max_parallel_per_domain = 8;      // Max concurrent requests per domain (if no crawl-delay)
+	int max_total_connections = 32;       // Global max concurrent connections across all domains
+
+	// Resource limits
+	int64_t max_response_bytes = 10 * 1024 * 1024;  // Max response size (10MB default)
+	bool compress = true;                  // Request gzip/deflate compression
 
 	unique_ptr<ParserExtensionParseData> Copy() const override;
 	string ToString() const override;

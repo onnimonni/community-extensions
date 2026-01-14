@@ -7,6 +7,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/appender.hpp"
 #include <set>
 
 #include <atomic>
@@ -22,10 +23,75 @@
 
 namespace duckdb {
 
+// Error classification for better analytics
+enum class CrawlErrorType : uint8_t {
+	NONE = 0,
+	NETWORK_TIMEOUT = 1,
+	NETWORK_DNS_FAILURE = 2,
+	NETWORK_CONNECTION_REFUSED = 3,
+	NETWORK_SSL_ERROR = 4,
+	HTTP_CLIENT_ERROR = 5,
+	HTTP_SERVER_ERROR = 6,
+	HTTP_RATE_LIMITED = 7,
+	ROBOTS_DISALLOWED = 8,
+	CONTENT_TOO_LARGE = 9,
+	CONTENT_TYPE_REJECTED = 10,
+	MAX_RETRIES_EXCEEDED = 11
+};
+
+static const char* ErrorTypeToString(CrawlErrorType type) {
+	switch (type) {
+		case CrawlErrorType::NONE: return "";
+		case CrawlErrorType::NETWORK_TIMEOUT: return "network_timeout";
+		case CrawlErrorType::NETWORK_DNS_FAILURE: return "network_dns_failure";
+		case CrawlErrorType::NETWORK_CONNECTION_REFUSED: return "network_connection_refused";
+		case CrawlErrorType::NETWORK_SSL_ERROR: return "network_ssl_error";
+		case CrawlErrorType::HTTP_CLIENT_ERROR: return "http_client_error";
+		case CrawlErrorType::HTTP_SERVER_ERROR: return "http_server_error";
+		case CrawlErrorType::HTTP_RATE_LIMITED: return "http_rate_limited";
+		case CrawlErrorType::ROBOTS_DISALLOWED: return "robots_disallowed";
+		case CrawlErrorType::CONTENT_TOO_LARGE: return "content_too_large";
+		case CrawlErrorType::CONTENT_TYPE_REJECTED: return "content_type_rejected";
+		case CrawlErrorType::MAX_RETRIES_EXCEEDED: return "max_retries_exceeded";
+		default: return "unknown";
+	}
+}
+
+// Classify error from HTTP response
+static CrawlErrorType ClassifyError(int status_code, const std::string &error_msg) {
+	if (status_code == 429) return CrawlErrorType::HTTP_RATE_LIMITED;
+	if (status_code >= 500 && status_code < 600) return CrawlErrorType::HTTP_SERVER_ERROR;
+	if (status_code >= 400 && status_code < 500) return CrawlErrorType::HTTP_CLIENT_ERROR;
+	if (status_code <= 0) {
+		// Network error - try to classify from message
+		if (error_msg.find("timeout") != std::string::npos ||
+		    error_msg.find("Timeout") != std::string::npos) {
+			return CrawlErrorType::NETWORK_TIMEOUT;
+		}
+		if (error_msg.find("DNS") != std::string::npos ||
+		    error_msg.find("resolve") != std::string::npos) {
+			return CrawlErrorType::NETWORK_DNS_FAILURE;
+		}
+		if (error_msg.find("SSL") != std::string::npos ||
+		    error_msg.find("certificate") != std::string::npos) {
+			return CrawlErrorType::NETWORK_SSL_ERROR;
+		}
+		if (error_msg.find("refused") != std::string::npos ||
+		    error_msg.find("connect") != std::string::npos) {
+			return CrawlErrorType::NETWORK_CONNECTION_REFUSED;
+		}
+		return CrawlErrorType::NETWORK_TIMEOUT;  // Default network error
+	}
+	return CrawlErrorType::NONE;
+}
+
 // Global signal flag for graceful shutdown
 static std::atomic<bool> g_shutdown_requested(false);
 static std::atomic<int> g_sigint_count(0);
 static std::chrono::steady_clock::time_point g_last_sigint_time;
+
+// Global connection counter for rate limiting across all domains
+static std::atomic<int> g_active_connections(0);
 
 // Signal handler
 static void SignalHandler(int signum) {
@@ -516,6 +582,9 @@ struct CrawlIntoBindData : public TableFunctionData {
 	bool update_stale = false;    // Re-crawl stale URLs based on sitemap lastmod/changefreq
 	int max_retry_backoff_seconds = 600;   // Max Fibonacci backoff for 429/5XX/timeout
 	int max_parallel_per_domain = 8;       // Max concurrent requests per domain (if no crawl-delay)
+	int max_total_connections = 32;        // Global max concurrent connections
+	int64_t max_response_bytes = 10 * 1024 * 1024;  // Max response size (10MB)
+	bool compress = true;                  // Request gzip compression
 };
 
 struct CrawlIntoGlobalState : public GlobalTableFunctionState {
@@ -533,8 +602,9 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 	auto bind_data = make_uniq<CrawlIntoBindData>();
 
 	// Get parameters from positional arguments (set by PlanCrawl)
-	// Order: mode, source_query, target_table, user_agent, delays..., url_filter, sitemap_cache_hours, update_stale, max_retry_backoff_seconds, max_parallel_per_domain
-	if (input.inputs.size() >= 15) {
+	// Order: mode, source_query, target_table, user_agent, delays..., url_filter, sitemap_cache_hours, update_stale,
+	//        max_retry_backoff_seconds, max_parallel_per_domain, max_total_connections, max_response_bytes, compress
+	if (input.inputs.size() >= 18) {
 		bind_data->crawl_mode = input.inputs[0].GetValue<int32_t>();
 		bind_data->source_query = StringValue::Get(input.inputs[1]);
 		bind_data->target_table = StringValue::Get(input.inputs[2]);
@@ -550,8 +620,11 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 		bind_data->update_stale = input.inputs[12].GetValue<bool>();
 		bind_data->max_retry_backoff_seconds = input.inputs[13].GetValue<int>();
 		bind_data->max_parallel_per_domain = input.inputs[14].GetValue<int>();
+		bind_data->max_total_connections = input.inputs[15].GetValue<int>();
+		bind_data->max_response_bytes = input.inputs[16].GetValue<int64_t>();
+		bind_data->compress = input.inputs[17].GetValue<bool>();
 	} else {
-		throw BinderException("crawl_into_internal: insufficient parameters (expected 15, got " +
+		throw BinderException("crawl_into_internal: insufficient parameters (expected 18, got " +
 		                      std::to_string(input.inputs.size()) + ")");
 	}
 
@@ -1082,18 +1155,38 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			break;
 		}
 
+		// Check global connection limit
+		while (g_active_connections >= bind_data.max_total_connections && !g_shutdown_requested) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		if (g_shutdown_requested) {
+			if (!domain_state.has_crawl_delay) {
+				domain_state.active_requests--;
+			}
+			break;
+		}
+
 		// Fetch URL
+		g_active_connections++;
 		auto fetch_start = std::chrono::steady_clock::now();
 		RetryConfig retry_config;
-		auto response = HttpClient::Fetch(context, entry.url, retry_config, bind_data.user_agent);
+		auto response = HttpClient::Fetch(context, entry.url, retry_config, bind_data.user_agent, bind_data.compress);
 		auto fetch_end = std::chrono::steady_clock::now();
 		auto fetch_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fetch_end - fetch_start).count();
+		g_active_connections--;
 
 		domain_state.last_crawl_time = fetch_end;
 
 		// Decrement active requests for parallel mode
 		if (!domain_state.has_crawl_delay) {
 			domain_state.active_requests--;
+		}
+
+		// Check response size limit
+		if (response.success && static_cast<int64_t>(response.body.size()) > bind_data.max_response_bytes) {
+			response.success = false;
+			response.error = "Response too large: " + std::to_string(response.body.size()) + " bytes";
+			response.body.clear();  // Don't store oversized content
 		}
 
 		// Check for retryable errors (429, 5XX, network errors)
@@ -1192,7 +1285,10 @@ void RegisterCrawlIntoFunction(ExtensionLoader &loader) {
 	                                LogicalType::DOUBLE,   // sitemap_cache_hours
 	                                LogicalType::BOOLEAN,  // update_stale
 	                                LogicalType::INTEGER,  // max_retry_backoff_seconds
-	                                LogicalType::INTEGER}, // max_parallel_per_domain
+	                                LogicalType::INTEGER,  // max_parallel_per_domain
+	                                LogicalType::INTEGER,  // max_total_connections
+	                                LogicalType::BIGINT,   // max_response_bytes
+	                                LogicalType::BOOLEAN}, // compress
 	                               CrawlIntoFunction, CrawlIntoBind, CrawlIntoInitGlobal);
 
 	loader.RegisterFunction(crawl_into_func);
