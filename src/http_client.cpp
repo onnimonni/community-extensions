@@ -93,9 +93,9 @@ HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string 
 		query = StringUtil::Format(
 		    "SELECT status, decode(body) AS body, "
 		    "content_type, "
-		    "headers['retry-after'] AS retry_after, "
+		    "headers['Retry-After'] AS retry_after, "
 		    "headers['Date'] AS server_date, "
-		    "headers['content-length'] AS content_length, "
+		    "headers['Content-Length'] AS content_length, "
 		    "headers['ETag'] AS etag, "
 		    "headers['Last-Modified'] AS last_modified "
 		    "FROM http_get('%s', headers := %s)",
@@ -104,9 +104,9 @@ HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string 
 		query = StringUtil::Format(
 		    "SELECT status, decode(body) AS body, "
 		    "content_type, "
-		    "headers['retry-after'] AS retry_after, "
+		    "headers['Retry-After'] AS retry_after, "
 		    "headers['Date'] AS server_date, "
-		    "headers['content-length'] AS content_length, "
+		    "headers['Content-Length'] AS content_length, "
 		    "headers['ETag'] AS etag, "
 		    "headers['Last-Modified'] AS last_modified "
 		    "FROM http_get('%s')",

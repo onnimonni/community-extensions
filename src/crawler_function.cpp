@@ -2,6 +2,7 @@
 #include "robots_parser.hpp"
 #include "sitemap_parser.hpp"
 #include "http_client.hpp"
+#include "link_parser.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
@@ -96,6 +97,41 @@ static std::chrono::steady_clock::time_point g_last_sigint_time;
 
 // Global connection counter for rate limiting across all domains
 static std::atomic<int> g_active_connections(0);
+
+// Registry for background crawls - maps target_table to shutdown flag
+struct BackgroundCrawlState {
+	std::atomic<bool> shutdown_requested{false};
+	std::atomic<bool> running{false};
+	std::thread thread;
+	std::string status;
+	int64_t rows_crawled = 0;
+	std::chrono::steady_clock::time_point start_time;
+};
+
+static std::mutex g_background_crawls_mutex;
+static std::unordered_map<std::string, std::shared_ptr<BackgroundCrawlState>> g_background_crawls;
+
+// Get or create background crawl state for a target table
+static std::shared_ptr<BackgroundCrawlState> GetBackgroundCrawlState(const std::string &target_table) {
+	std::lock_guard<std::mutex> lock(g_background_crawls_mutex);
+	auto it = g_background_crawls.find(target_table);
+	if (it != g_background_crawls.end()) {
+		return it->second;
+	}
+	auto state = std::make_shared<BackgroundCrawlState>();
+	g_background_crawls[target_table] = state;
+	return state;
+}
+
+// Check if a background crawl should stop
+static bool ShouldStopBackgroundCrawl(const std::string &target_table) {
+	std::lock_guard<std::mutex> lock(g_background_crawls_mutex);
+	auto it = g_background_crawls.find(target_table);
+	if (it != g_background_crawls.end()) {
+		return it->second->shutdown_requested.load();
+	}
+	return false;
+}
 
 // Signal handler
 static void SignalHandler(int signum) {
@@ -270,7 +306,6 @@ static std::string ParseAndValidateServerDate(const std::string &server_date) {
 // Crawl result for a single URL
 struct CrawlResult {
 	std::string url;
-	std::string domain;
 	int http_status;
 	std::string body;
 	std::string content_type;
@@ -558,9 +593,6 @@ static unique_ptr<FunctionData> CrawlerBind(ClientContext &context, TableFunctio
 	names.emplace_back("surt_key");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
-	names.emplace_back("domain");
-	return_types.emplace_back(LogicalType::VARCHAR);
-
 	names.emplace_back("http_status");
 	return_types.emplace_back(LogicalType::INTEGER);
 
@@ -685,16 +717,15 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 			output.SetCardinality(1);
 			output.SetValue(0, 0, Value(url));
 			output.SetValue(1, 0, Value(surt_key));
-			output.SetValue(2, 0, Value(domain));
-			output.SetValue(3, 0, Value(-1)); // Special status for robots.txt disallow
+			output.SetValue(2, 0, Value(-1)); // Special status for robots.txt disallow
+			output.SetValue(3, 0, Value());
 			output.SetValue(4, 0, Value());
-			output.SetValue(5, 0, Value());
-			output.SetValue(6, 0, Value(0));
-			output.SetValue(7, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
-			output.SetValue(8, 0, Value("robots.txt disallow"));
-			output.SetValue(9, 0, Value());   // etag
-			output.SetValue(10, 0, Value());  // last_modified
-			output.SetValue(11, 0, Value());  // content_hash
+			output.SetValue(5, 0, Value(0));
+			output.SetValue(6, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+			output.SetValue(7, 0, Value("robots.txt disallow"));
+			output.SetValue(8, 0, Value());   // etag
+			output.SetValue(9, 0, Value());  // last_modified
+			output.SetValue(10, 0, Value());  // content_hash
 			return;
 		} else {
 			// Skip silently, try next URL
@@ -747,17 +778,16 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 	output.SetCardinality(1);
 	output.SetValue(0, 0, Value(url));
 	output.SetValue(1, 0, Value(surt_key));
-	output.SetValue(2, 0, Value(domain));
-	output.SetValue(3, 0, Value(response.status_code));
-	output.SetValue(4, 0, response.body.empty() ? Value() : Value(response.body));
-	output.SetValue(5, 0, response.content_type.empty() ? Value() : Value(response.content_type));
-	output.SetValue(6, 0, Value(fetch_elapsed_ms));
-	output.SetValue(7, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
-	output.SetValue(8, 0, response.error.empty() ? Value() : Value(response.error));
-	output.SetValue(9, 0, response.etag.empty() ? Value() : Value(response.etag));
-	output.SetValue(10, 0, response.last_modified.empty() ? Value() : Value(response.last_modified));
+	output.SetValue(2, 0, Value(response.status_code));
+	output.SetValue(3, 0, response.body.empty() ? Value() : Value(response.body));
+	output.SetValue(4, 0, response.content_type.empty() ? Value() : Value(response.content_type));
+	output.SetValue(5, 0, Value(fetch_elapsed_ms));
+	output.SetValue(6, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+	output.SetValue(7, 0, response.error.empty() ? Value() : Value(response.error));
+	output.SetValue(8, 0, response.etag.empty() ? Value() : Value(response.etag));
+	output.SetValue(9, 0, response.last_modified.empty() ? Value() : Value(response.last_modified));
 	std::string content_hash = GenerateContentHash(response.body);
-	output.SetValue(11, 0, content_hash.empty() ? Value() : Value(content_hash));
+	output.SetValue(10, 0, content_hash.empty() ? Value() : Value(content_hash));
 }
 
 void RegisterCrawlerFunction(ExtensionLoader &loader) {
@@ -778,11 +808,11 @@ void RegisterCrawlerFunction(ExtensionLoader &loader) {
 }
 
 //===--------------------------------------------------------------------===//
-// crawl_into_internal - Used by CRAWL INTO parser extension
+// crawl_into_internal - Used by CRAWL CONCURRENTLY parser extension
 //===--------------------------------------------------------------------===//
 
 struct CrawlIntoBindData : public TableFunctionData {
-	int crawl_mode = 0;           // 0=URLS, 1=SITES
+	int statement_type = 0;       // 0=CRAWL
 	std::string source_query;
 	std::string target_table;
 	std::string user_agent;
@@ -792,7 +822,7 @@ struct CrawlIntoBindData : public TableFunctionData {
 	int timeout_seconds = 30;
 	bool respect_robots_txt = true;
 	bool log_skipped = true;
-	std::string url_filter;       // LIKE pattern for filtering URLs in SITES mode
+	std::string url_filter;       // LIKE pattern for filtering URLs
 	double sitemap_cache_hours = 24.0;  // Hours to cache sitemap discovery results
 	bool update_stale = false;    // Re-crawl stale URLs based on sitemap lastmod/changefreq
 	int max_retry_backoff_seconds = 600;   // Max Fibonacci backoff for 429/5XX/timeout
@@ -802,6 +832,13 @@ struct CrawlIntoBindData : public TableFunctionData {
 	bool compress = true;                  // Request gzip compression
 	std::string accept_content_types;      // Only accept these content types
 	std::string reject_content_types;      // Reject these content types
+	// Link-following fallback
+	bool follow_links = false;
+	bool allow_subdomains = false;
+	int max_crawl_pages = 10000;
+	int max_crawl_depth = 10;
+	bool respect_nofollow = true;
+	bool follow_canonical = true;
 };
 
 struct CrawlIntoGlobalState : public GlobalTableFunctionState {
@@ -819,11 +856,12 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 	auto bind_data = make_uniq<CrawlIntoBindData>();
 
 	// Get parameters from positional arguments (set by PlanCrawl)
-	// Order: mode, source_query, target_table, user_agent, delays..., url_filter, sitemap_cache_hours, update_stale,
-	//        max_retry_backoff_seconds, max_parallel_per_domain, max_total_connections, max_response_bytes, compress,
-	//        accept_content_types, reject_content_types
-	if (input.inputs.size() >= 20) {
-		bind_data->crawl_mode = input.inputs[0].GetValue<int32_t>();
+	// Order: statement_type, source_query, target_table, user_agent, delays..., url_filter, sitemap_cache_hours,
+	//        update_stale, max_retry_backoff_seconds, max_parallel_per_domain, max_total_connections, max_response_bytes,
+	//        compress, accept_content_types, reject_content_types, follow_links, allow_subdomains, max_crawl_pages,
+	//        max_crawl_depth, respect_nofollow, follow_canonical
+	if (input.inputs.size() >= 26) {
+		bind_data->statement_type = input.inputs[0].GetValue<int32_t>();
 		bind_data->source_query = StringValue::Get(input.inputs[1]);
 		bind_data->target_table = StringValue::Get(input.inputs[2]);
 		bind_data->user_agent = StringValue::Get(input.inputs[3]);
@@ -843,8 +881,14 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 		bind_data->compress = input.inputs[17].GetValue<bool>();
 		bind_data->accept_content_types = StringValue::Get(input.inputs[18]);
 		bind_data->reject_content_types = StringValue::Get(input.inputs[19]);
+		bind_data->follow_links = input.inputs[20].GetValue<bool>();
+		bind_data->allow_subdomains = input.inputs[21].GetValue<bool>();
+		bind_data->max_crawl_pages = input.inputs[22].GetValue<int>();
+		bind_data->max_crawl_depth = input.inputs[23].GetValue<int>();
+		bind_data->respect_nofollow = input.inputs[24].GetValue<bool>();
+		bind_data->follow_canonical = input.inputs[25].GetValue<bool>();
 	} else {
-		throw BinderException("crawl_into_internal: insufficient parameters (expected 20, got " +
+		throw BinderException("crawl_into_internal: insufficient parameters (expected 26, got " +
 		                      std::to_string(input.inputs.size()) + ")");
 	}
 
@@ -1063,6 +1107,53 @@ static void CacheSitemapUrls(Connection &conn, const std::string &hostname,
 }
 
 //===--------------------------------------------------------------------===//
+// Discovery Status Cache (tracks sitemap vs link-crawl vs not_found)
+//===--------------------------------------------------------------------===//
+
+struct DiscoveryStatus {
+	bool is_valid = false;
+	std::string method;  // "sitemap", "link_crawl", "not_found"
+	int urls_found = 0;
+};
+
+static void EnsureDiscoveryStatusTable(Connection &conn) {
+	conn.Query("CREATE TABLE IF NOT EXISTS _crawl_sitemap_discovery_status ("
+	           "hostname VARCHAR PRIMARY KEY, "
+	           "discovery_method VARCHAR, "
+	           "discovered_at TIMESTAMP DEFAULT NOW(), "
+	           "urls_found INTEGER DEFAULT 0)");
+}
+
+static DiscoveryStatus GetDiscoveryStatus(Connection &conn, const std::string &hostname, double cache_hours) {
+	DiscoveryStatus status;
+
+	auto result = conn.Query(
+	    "SELECT discovery_method, urls_found FROM _crawl_sitemap_discovery_status "
+	    "WHERE hostname = $1 AND discovered_at > NOW() - INTERVAL '" + std::to_string(cache_hours) + " hours'",
+	    hostname);
+
+	if (!result->HasError()) {
+		auto chunk = result->Fetch();
+		if (chunk && chunk->size() > 0) {
+			status.is_valid = true;
+			auto method_val = chunk->GetValue(0, 0);
+			auto count_val = chunk->GetValue(1, 0);
+			status.method = method_val.IsNull() ? "" : StringValue::Get(method_val);
+			status.urls_found = count_val.IsNull() ? 0 : count_val.GetValue<int>();
+		}
+	}
+	return status;
+}
+
+static void UpdateDiscoveryStatus(Connection &conn, const std::string &hostname,
+                                   const std::string &method, int urls_found) {
+	conn.Query("INSERT OR REPLACE INTO _crawl_sitemap_discovery_status "
+	           "(hostname, discovery_method, discovered_at, urls_found) "
+	           "VALUES ($1, $2, NOW(), $3)",
+	           hostname, method, urls_found);
+}
+
+//===--------------------------------------------------------------------===//
 // Persistent Queue for Crash Recovery
 //===--------------------------------------------------------------------===//
 
@@ -1097,7 +1188,6 @@ static void RemoveFromQueue(Connection &conn, const std::string &target_table, c
 struct BatchCrawlEntry {
 	std::string url;
 	std::string surt_key;
-	std::string domain;
 	int status_code;
 	std::string body;
 	std::string content_type;
@@ -1123,12 +1213,12 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 	for (const auto &result : batch) {
 		if (result.is_update) {
 			auto update_sql = "UPDATE " + target_table +
-			                  " SET surt_key = $2, domain = $3, http_status = $4, body = $5, content_type = $6, "
-			                  "elapsed_ms = $7, crawled_at = " + result.timestamp_expr + ", error = $8, "
-			                  "etag = $9, last_modified = $10, content_hash = $11 "
+			                  " SET surt_key = $2, http_status = $3, body = $4, content_type = $5, "
+			                  "elapsed_ms = $6, crawled_at = " + result.timestamp_expr + ", error = $7, "
+			                  "etag = $8, last_modified = $9, content_hash = $10 "
 			                  "WHERE url = $1";
 
-			auto update_result = conn.Query(update_sql, result.url, result.surt_key, result.domain, result.status_code,
+			auto update_result = conn.Query(update_sql, result.url, result.surt_key, result.status_code,
 			                                 result.body.empty() ? Value() : Value(result.body),
 			                                 result.content_type.empty() ? Value() : Value(result.content_type),
 			                                 result.elapsed_ms,
@@ -1143,10 +1233,10 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			}
 		} else {
 			auto insert_sql = "INSERT INTO " + target_table +
-			                  " (url, surt_key, domain, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash) "
-			                  "VALUES ($1, $2, $3, $4, $5, $6, $7, " + result.timestamp_expr + ", $8, $9, $10, $11)";
+			                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash) "
+			                  "VALUES ($1, $2, $3, $4, $5, $6, " + result.timestamp_expr + ", $7, $8, $9, $10)";
 
-			auto insert_result = conn.Query(insert_sql, result.url, result.surt_key, result.domain, result.status_code,
+			auto insert_result = conn.Query(insert_sql, result.url, result.surt_key, result.status_code,
 			                                 result.body.empty() ? Value() : Value(result.body),
 			                                 result.content_type.empty() ? Value() : Value(result.content_type),
 			                                 result.elapsed_ms,
@@ -1210,6 +1300,24 @@ static int64_t GetQueueSize(Connection &conn, const std::string &target_table) {
 }
 
 //===--------------------------------------------------------------------===//
+// Ensure target table exists for crawl results
+static void EnsureTargetTable(Connection &conn, const std::string &target_table) {
+	conn.Query("CREATE TABLE IF NOT EXISTS \"" + target_table + "\" ("
+	           "url VARCHAR PRIMARY KEY, "
+	           "surt_key VARCHAR, "
+	           "http_status INTEGER, "
+	           "body VARCHAR, "
+	           "content_type VARCHAR, "
+	           "elapsed_ms BIGINT, "
+	           "crawled_at TIMESTAMP, "
+	           "error VARCHAR, "
+	           "etag VARCHAR, "
+	           "last_modified VARCHAR, "
+	           "content_hash VARCHAR, "
+	           "error_type VARCHAR)");
+}
+
+//===--------------------------------------------------------------------===//
 // Progress Reporting
 //===--------------------------------------------------------------------===//
 
@@ -1265,35 +1373,319 @@ static void GetLatestProgress(Connection &conn, const std::string &target_table,
 	bytes_downloaded = 0;
 }
 
+// Input type for CRAWL SITES
+enum class SiteInputType {
+	HOSTNAME,        // "example.com" - discover sitemap, fallback to spider
+	HOSTNAME_PATH,   // "example.com/blog/" - discover sitemap, spider from path
+	DIRECT_SITEMAP,  // "https://example.com/sitemap.xml" - fetch sitemap directly
+	PAGE_URL         // "https://example.com/page?q=1" - discover sitemap, spider from URL
+};
+
+struct ParsedSiteInput {
+	std::string hostname;
+	std::string start_url;      // For spider fallback
+	std::string sitemap_url;    // If direct sitemap provided
+	SiteInputType type;
+};
+
+// Check if URL looks like a sitemap
+static bool IsSitemapUrl(const std::string &url) {
+	std::string lower = url;
+	std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+	// Check common sitemap patterns
+	if (lower.find("/sitemap") != std::string::npos) return true;
+	if (lower.length() > 4 && lower.substr(lower.length() - 4) == ".xml") return true;
+	if (lower.find("sitemap_index") != std::string::npos) return true;
+
+	return false;
+}
+
+// Helper: Check if a string looks like a valid URL or hostname
+// Valid formats: "example.com", "example.com/path", "https://example.com", "http://example.com/path"
+static bool IsValidUrlOrHostname(const std::string &input) {
+	if (input.empty()) return false;
+
+	// Must contain at least one dot (domain)
+	if (input.find('.') == std::string::npos) return false;
+
+	// Check for full URL with protocol
+	if (input.find("://") != std::string::npos) {
+		// Must start with http:// or https://
+		if (input.substr(0, 7) != "http://" && input.substr(0, 8) != "https://") {
+			return false;
+		}
+		// Must have something after protocol
+		size_t start = input.find("://") + 3;
+		if (start >= input.length()) return false;
+		// Check domain part has a dot
+		std::string rest = input.substr(start);
+		size_t slash = rest.find('/');
+		std::string domain = (slash != std::string::npos) ? rest.substr(0, slash) : rest;
+		if (domain.find('.') == std::string::npos) return false;
+		return true;
+	}
+
+	// Hostname or hostname/path format
+	// Extract hostname part (before first slash)
+	size_t slash_pos = input.find('/');
+	std::string hostname = (slash_pos != std::string::npos) ? input.substr(0, slash_pos) : input;
+
+	// Hostname must have a dot
+	if (hostname.find('.') == std::string::npos) return false;
+
+	// Basic hostname validation: alphanumeric, dots, and hyphens
+	for (char c : hostname) {
+		if (!std::isalnum(c) && c != '.' && c != '-') return false;
+	}
+
+	// Can't start or end with dot or hyphen
+	if (hostname.front() == '.' || hostname.front() == '-') return false;
+	if (hostname.back() == '.' || hostname.back() == '-') return false;
+
+	return true;
+}
+
+// Helper: Parse site input - handles various formats:
+// - "example.com" → discover sitemap, spider from /
+// - "example.com/blog/" → discover sitemap, spider from /blog/
+// - "https://example.com/sitemap.xml" → fetch sitemap directly
+// - "https://example.com/page?q=1" → discover sitemap, spider from page URL
+static ParsedSiteInput ParseSiteInput(const std::string &input) {
+	ParsedSiteInput result;
+
+	// Check if it's a full URL
+	if (input.find("://") != std::string::npos) {
+		result.hostname = LinkParser::ExtractDomain(input);
+
+		if (IsSitemapUrl(input)) {
+			// Direct sitemap URL
+			result.type = SiteInputType::DIRECT_SITEMAP;
+			result.sitemap_url = input;
+			result.start_url = "https://" + result.hostname + "/";
+		} else {
+			// Page URL - use as spider start point
+			result.type = SiteInputType::PAGE_URL;
+			result.start_url = input;
+		}
+	} else {
+		// Could be "example.com" or "example.com/path/"
+		size_t slash_pos = input.find('/');
+		if (slash_pos != std::string::npos) {
+			result.hostname = input.substr(0, slash_pos);
+			std::string path = input.substr(slash_pos);
+			result.start_url = "https://" + result.hostname + path;
+			result.type = SiteInputType::HOSTNAME_PATH;
+		} else {
+			result.hostname = input;
+			result.start_url = "https://" + result.hostname + "/";
+			result.type = SiteInputType::HOSTNAME;
+		}
+	}
+
+	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// Link-Based URL Discovery (BFS Crawling)
+//===--------------------------------------------------------------------===//
+
+// Discover URLs by following links (used as fallback when no sitemap)
+static std::vector<std::string> DiscoverUrlsViaLinks(
+    DatabaseInstance &db,
+    const std::string &start_url,
+    const std::string &base_hostname,
+    const std::string &user_agent,
+    double default_crawl_delay,
+    bool allow_subdomains,
+    int max_pages,
+    int max_depth,
+    bool respect_nofollow,
+    bool follow_canonical,
+    DomainState &domain_state) {
+
+	std::vector<std::string> discovered_urls;
+	std::set<std::string> visited_urls;
+	std::set<std::string> queued_urls;
+
+	// BFS queue: (url, depth)
+	std::queue<std::pair<std::string, int>> url_queue;
+	url_queue.push({start_url, 0});
+	queued_urls.insert(start_url);
+
+	std::string base_domain = LinkParser::ExtractBaseDomain(base_hostname);
+
+	RetryConfig retry_config;
+	retry_config.max_retries = 2;
+
+	int pages_crawled = 0;
+
+	while (!url_queue.empty() && !g_shutdown_requested && pages_crawled < max_pages) {
+		auto front = url_queue.front();
+		url_queue.pop();
+		const std::string &url = front.first;
+		int depth = front.second;
+
+		if (depth > max_depth) {
+			continue;
+		}
+
+		if (visited_urls.count(url)) {
+			continue;
+		}
+		visited_urls.insert(url);
+
+		std::string url_domain = LinkParser::ExtractDomain(url);
+		std::string url_path = LinkParser::ExtractPath(url);
+
+		// Check robots.txt (only for base domain, assume fetched already)
+		if (url_domain == base_hostname && domain_state.robots_fetched) {
+			if (!RobotsParser::IsAllowed(domain_state.rules, url_path)) {
+				continue;  // Disallowed by robots.txt
+			}
+		}
+
+		// Respect rate limiting
+		auto now = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		    now - domain_state.last_crawl_time).count();
+		auto required_delay_ms = static_cast<int64_t>(domain_state.crawl_delay_seconds * 1000);
+
+		if (elapsed < required_delay_ms) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(required_delay_ms - elapsed));
+		}
+
+		// Fetch page
+		auto response = HttpClient::Fetch(db, url, retry_config, user_agent);
+		domain_state.last_crawl_time = std::chrono::steady_clock::now();
+
+		if (!response.success || response.status_code != 200) {
+			continue;
+		}
+
+		// Check if HTML
+		if (response.content_type.find("text/html") == std::string::npos) {
+			discovered_urls.push_back(url);
+			pages_crawled++;
+			continue;
+		}
+
+		// Check for nofollow meta tag
+		if (respect_nofollow && LinkParser::HasNoFollowMeta(response.body)) {
+			discovered_urls.push_back(url);
+			pages_crawled++;
+			continue;  // Don't follow links from this page
+		}
+
+		// Check for canonical URL
+		if (follow_canonical) {
+			std::string canonical = LinkParser::ExtractCanonical(response.body, url);
+			if (!canonical.empty() && canonical != url) {
+				// Use canonical URL instead
+				if (!visited_urls.count(canonical) && !queued_urls.count(canonical)) {
+					if (LinkParser::IsSameDomain(canonical, base_domain, allow_subdomains)) {
+						queued_urls.insert(canonical);
+						url_queue.push({canonical, depth});
+					}
+				}
+				continue;  // Skip this URL, use canonical
+			}
+		}
+
+		discovered_urls.push_back(url);
+		pages_crawled++;
+
+		// Extract links from page
+		auto links = LinkParser::ExtractLinks(response.body, url);
+
+		for (const auto &link : links) {
+			// Skip nofollow links if respect_nofollow is enabled
+			if (respect_nofollow && link.nofollow) {
+				continue;
+			}
+
+			// Skip already visited or queued
+			if (visited_urls.count(link.url) || queued_urls.count(link.url)) {
+				continue;
+			}
+
+			// Check domain policy
+			if (!LinkParser::IsSameDomain(link.url, base_domain, allow_subdomains)) {
+				continue;
+			}
+
+			// Only follow http/https
+			if (link.url.find("https://") != 0 && link.url.find("http://") != 0) {
+				continue;
+			}
+
+			queued_urls.insert(link.url);
+			url_queue.push({link.url, depth + 1});
+		}
+	}
+
+	return discovered_urls;
+}
+
 // Result from parallel sitemap discovery
 struct SitemapDiscoveryResult {
 	std::string hostname;
+	std::string start_url;  // Full URL including path
 	std::vector<std::string> urls;
 	DomainState domain_state;
 };
 
-// Thread-safe sitemap discovery for parallel execution
+// Thread-safe sitemap discovery for parallel execution (with link fallback support)
+// Handles various input formats:
+// - "example.com" → robots.txt → bruteforce sitemaps → spider (if follow_links)
+// - "example.com/path/" → robots.txt → bruteforce sitemaps → spider from path
+// - "https://example.com/sitemap.xml" → fetch sitemap directly (still check robots.txt)
+// - "https://example.com/page?q=1" → robots.txt → sitemaps → spider from page URL
 static SitemapDiscoveryResult DiscoverSitemapUrlsThreadSafe(DatabaseInstance &db,
-                                                             const std::string &hostname,
+                                                             const std::string &input,
                                                              const std::string &user_agent,
-                                                             double default_crawl_delay, double cache_hours) {
+                                                             double default_crawl_delay, double cache_hours,
+                                                             bool follow_links, bool allow_subdomains,
+                                                             int max_crawl_pages, int max_crawl_depth,
+                                                             bool respect_nofollow, bool follow_canonical) {
+	// Parse input to determine type and extract hostname/URLs
+	auto parsed = ParseSiteInput(input);
+
 	SitemapDiscoveryResult result;
-	result.hostname = hostname;
+	result.hostname = parsed.hostname;
+	result.start_url = parsed.start_url;
 	result.domain_state.crawl_delay_seconds = default_crawl_delay;
 	result.domain_state.min_crawl_delay_seconds = default_crawl_delay;
 
 	// Create own connection for thread safety
 	Connection conn(db);
 
-	// Check cache first
-	EnsureSitemapCacheTable(conn);
-	auto cached_urls = GetCachedSitemapUrls(conn, hostname, cache_hours);
-	if (!cached_urls.empty()) {
-		result.urls = cached_urls;
-		return result;
+	// Check discovery status cache first (skip for direct sitemap URLs)
+	if (parsed.type != SiteInputType::DIRECT_SITEMAP) {
+		EnsureDiscoveryStatusTable(conn);
+		auto status = GetDiscoveryStatus(conn, parsed.hostname, cache_hours);
+
+		if (status.is_valid) {
+			if (status.method == "sitemap" || status.method == "link_crawl") {
+				// Check sitemap URL cache
+				EnsureSitemapCacheTable(conn);
+				auto cached_urls = GetCachedSitemapUrls(conn, parsed.hostname, cache_hours);
+				if (!cached_urls.empty()) {
+					result.urls = cached_urls;
+					return result;
+				}
+			} else if (status.method == "not_found" && !follow_links) {
+				// Previously found nothing and no fallback enabled
+				return result;
+			}
+			// If not_found but follow_links now enabled, retry
+		}
 	}
 
-	// No valid cache - discover sitemaps
+	// Ensure cache table exists
+	EnsureSitemapCacheTable(conn);
+
+	// Try sitemap discovery
 	std::vector<SitemapEntry> sitemap_entries;
 	std::set<std::string> processed_sitemaps;
 	std::vector<std::string> to_process;
@@ -1301,16 +1693,11 @@ static SitemapDiscoveryResult DiscoverSitemapUrlsThreadSafe(DatabaseInstance &db
 	RetryConfig retry_config;
 	retry_config.max_retries = 2;
 
-	// Step 1: Try robots.txt for Sitemap directives
-	std::string robots_url = "https://" + hostname + "/robots.txt";
+	// Step 1: Always fetch robots.txt for rate limiting (even for direct sitemap URLs)
+	std::string robots_url = "https://" + parsed.hostname + "/robots.txt";
 	auto robots_response = HttpClient::Fetch(db, robots_url, retry_config, user_agent);
 
 	if (robots_response.success) {
-		auto sitemaps_from_robots = SitemapParser::ExtractSitemapsFromRobotsTxt(robots_response.body);
-		for (auto &sm : sitemaps_from_robots) {
-			to_process.push_back(sm);
-		}
-
 		// Parse robots rules for rate limiting
 		auto robots_data = RobotsParser::Parse(robots_response.body);
 		result.domain_state.rules = RobotsParser::GetRulesForUserAgent(robots_data, user_agent);
@@ -1320,13 +1707,25 @@ static SitemapDiscoveryResult DiscoverSitemapUrlsThreadSafe(DatabaseInstance &db
 		}
 		result.domain_state.min_crawl_delay_seconds = result.domain_state.crawl_delay_seconds;
 		result.domain_state.robots_fetched = true;
+
+		// Extract sitemaps from robots.txt (unless we have a direct sitemap URL)
+		if (parsed.type != SiteInputType::DIRECT_SITEMAP) {
+			auto sitemaps_from_robots = SitemapParser::ExtractSitemapsFromRobotsTxt(robots_response.body);
+			for (auto &sm : sitemaps_from_robots) {
+				to_process.push_back(sm);
+			}
+		}
 	}
 
-	// Step 2: If no sitemaps found, bruteforce common locations
-	if (to_process.empty()) {
+	// Step 2: Handle based on input type
+	if (parsed.type == SiteInputType::DIRECT_SITEMAP) {
+		// Direct sitemap URL provided - use it directly
+		to_process.push_back(parsed.sitemap_url);
+	} else if (to_process.empty()) {
+		// No sitemaps from robots.txt - bruteforce common locations
 		auto common_paths = SitemapParser::GetCommonSitemapPaths();
 		for (auto &path : common_paths) {
-			to_process.push_back("https://" + hostname + path);
+			to_process.push_back("https://" + parsed.hostname + path);
 		}
 	}
 
@@ -1360,14 +1759,43 @@ static SitemapDiscoveryResult DiscoverSitemapUrlsThreadSafe(DatabaseInstance &db
 		}
 	}
 
-	// Cache discovered entries
+	// If sitemap found, cache and return
 	if (!sitemap_entries.empty()) {
-		CacheSitemapUrls(conn, hostname, sitemap_entries);
+		CacheSitemapUrls(conn, parsed.hostname, sitemap_entries);
+		UpdateDiscoveryStatus(conn, parsed.hostname, "sitemap", sitemap_entries.size());
+
+		for (const auto &entry : sitemap_entries) {
+			result.urls.push_back(entry.loc);
+		}
+		return result;
 	}
 
-	// Return just URLs
-	for (const auto &entry : sitemap_entries) {
-		result.urls.push_back(entry.loc);
+	// No sitemap found - try link-based discovery if enabled
+	// For PAGE_URL type, always try spider from the provided URL (if follow_links)
+	// For HOSTNAME/HOSTNAME_PATH, spider from start_url
+	if (follow_links) {
+		auto link_urls = DiscoverUrlsViaLinks(
+		    db, parsed.start_url, parsed.hostname, user_agent, default_crawl_delay,
+		    allow_subdomains, max_crawl_pages, max_crawl_depth,
+		    respect_nofollow, follow_canonical, result.domain_state);
+
+		if (!link_urls.empty()) {
+			// Cache discovered URLs
+			std::vector<SitemapEntry> entries;
+			for (const auto &url : link_urls) {
+				entries.push_back({url, "", "", ""});
+			}
+			CacheSitemapUrls(conn, parsed.hostname, entries);
+			UpdateDiscoveryStatus(conn, parsed.hostname, "link_crawl", link_urls.size());
+
+			result.urls = link_urls;
+			return result;
+		}
+	}
+
+	// Nothing found - cache negative result (but not for direct sitemap - those should just return empty)
+	if (parsed.type != SiteInputType::DIRECT_SITEMAP) {
+		UpdateDiscoveryStatus(conn, parsed.hostname, "not_found", 0);
 	}
 	return result;
 }
@@ -1491,15 +1919,46 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		throw IOException("CRAWL source query error: " + query_result->GetError());
 	}
 
-	// Collect values from first column
+	// Collect values from first column - must be valid URLs or hostnames
 	std::vector<std::string> source_values;
+	std::vector<std::string> invalid_values;
 	while (auto chunk = query_result->Fetch()) {
 		for (idx_t i = 0; i < chunk->size(); i++) {
 			auto val = chunk->GetValue(0, i);
 			if (!val.IsNull()) {
-				source_values.push_back(StringValue::Get(val));
+				// Check if value is a string type
+				if (val.type().id() != LogicalTypeId::VARCHAR) {
+					// Try to convert to string representation
+					std::string str_val = val.ToString();
+					if (!IsValidUrlOrHostname(str_val)) {
+						invalid_values.push_back(str_val);
+						continue;
+					}
+					source_values.push_back(str_val);
+				} else {
+					std::string str_val = StringValue::Get(val);
+					if (!IsValidUrlOrHostname(str_val)) {
+						invalid_values.push_back(str_val);
+						continue;
+					}
+					source_values.push_back(str_val);
+				}
 			}
 		}
+	}
+
+	// Report invalid values
+	if (!invalid_values.empty()) {
+		std::string msg = "CRAWL source query returned invalid URL/hostname values: ";
+		for (size_t i = 0; i < std::min(invalid_values.size(), (size_t)5); i++) {
+			if (i > 0) msg += ", ";
+			msg += "'" + invalid_values[i] + "'";
+		}
+		if (invalid_values.size() > 5) {
+			msg += " (and " + std::to_string(invalid_values.size() - 5) + " more)";
+		}
+		msg += ". Expected format: 'example.com', 'example.com/path', or 'https://example.com/path'";
+		throw IOException(msg);
 	}
 
 	if (source_values.empty()) {
@@ -1516,61 +1975,61 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 
 	// Initialize progress tracking
 	EnsureProgressTable(conn, bind_data.target_table);
+
+	// Ensure target table exists for results
+	EnsureTargetTable(conn, bind_data.target_table);
+
 	auto crawl_start_time = std::chrono::steady_clock::now();
 
 	// Check for existing queued URLs (resume from previous run)
 	auto queued_entries = LoadQueuedUrls(conn, bind_data.target_table);
 	bool is_resume = !queued_entries.empty();
 
-	// Determine URLs to crawl based on mode
+	// Discover URLs from hostnames/sites - always use discovery mode
 	std::vector<std::string> urls;
+	auto &db = DatabaseInstance::GetDatabase(context);
 
-	if (bind_data.crawl_mode == 1) {  // SITES mode
-		// source_values are hostnames - discover sitemaps in parallel
-		auto &db = DatabaseInstance::GetDatabase(context);
+	// Limit parallel discovery to max_parallel_per_domain (or 8 if not set)
+	int max_parallel = std::min((int)source_values.size(), bind_data.max_parallel_per_domain);
+	if (max_parallel < 1) max_parallel = 8;
 
-		// Limit parallel discovery to max_parallel_per_domain (or 8 if not set)
-		int max_parallel = std::min((int)source_values.size(), bind_data.max_parallel_per_domain);
-		if (max_parallel < 1) max_parallel = 8;
+	std::vector<std::future<SitemapDiscoveryResult>> futures;
+	std::vector<SitemapDiscoveryResult> results;
 
-		std::vector<std::future<SitemapDiscoveryResult>> futures;
-		std::vector<SitemapDiscoveryResult> results;
-
-		size_t idx = 0;
-		while (idx < source_values.size() && !g_shutdown_requested) {
-			// Launch batch of async tasks
-			futures.clear();
-			for (int i = 0; i < max_parallel && idx < source_values.size(); i++, idx++) {
-				const auto &hostname = source_values[idx];
-				futures.push_back(std::async(std::launch::async,
-				    DiscoverSitemapUrlsThreadSafe,
-				    std::ref(db), hostname, bind_data.user_agent,
-				    bind_data.default_crawl_delay, bind_data.sitemap_cache_hours));
-			}
-
-			// Collect results from this batch
-			for (auto &f : futures) {
-				if (g_shutdown_requested) break;
-				try {
-					results.push_back(f.get());
-				} catch (...) {
-					// Silently skip failed discoveries
-				}
-			}
+	size_t idx = 0;
+	while (idx < source_values.size() && !g_shutdown_requested) {
+		// Launch batch of async tasks
+		futures.clear();
+		for (int i = 0; i < max_parallel && idx < source_values.size(); i++, idx++) {
+			const auto &input = source_values[idx];
+			futures.push_back(std::async(std::launch::async,
+			    DiscoverSitemapUrlsThreadSafe,
+			    std::ref(db), input, bind_data.user_agent,
+			    bind_data.default_crawl_delay, bind_data.sitemap_cache_hours,
+			    bind_data.follow_links, bind_data.allow_subdomains,
+			    bind_data.max_crawl_pages, bind_data.max_crawl_depth,
+			    bind_data.respect_nofollow, bind_data.follow_canonical));
 		}
 
-		// Merge results into domain_states and urls
-		for (auto &res : results) {
-			domain_states[res.hostname] = res.domain_state;
-			for (const auto &url : res.urls) {
-				if (bind_data.url_filter.empty() || MatchesLikePattern(url, bind_data.url_filter)) {
-					urls.push_back(url);
-				}
+		// Collect results from this batch
+		for (auto &f : futures) {
+			if (g_shutdown_requested) break;
+			try {
+				results.push_back(f.get());
+			} catch (...) {
+				// Silently skip failed discoveries
 			}
 		}
-	} else {
-		// URLS mode - source_values are already URLs
-		urls = std::move(source_values);
+	}
+
+	// Merge results into domain_states and urls
+	for (auto &res : results) {
+		domain_states[res.hostname] = res.domain_state;
+		for (const auto &url : res.urls) {
+			if (bind_data.url_filter.empty() || MatchesLikePattern(url, bind_data.url_filter)) {
+				urls.push_back(url);
+			}
+		}
 	}
 
 	if (urls.empty()) {
@@ -1671,7 +2130,12 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 	std::string current_domain;
 
 	// Process URL priority queue with retry logic
-	while (!url_queue.empty() && !g_shutdown_requested) {
+	// Check both global shutdown and specific crawl stop signal
+	auto should_stop = [&]() {
+		return g_shutdown_requested || ShouldStopBackgroundCrawl(bind_data.target_table);
+	};
+
+	while (!url_queue.empty() && !should_stop()) {
 		auto entry = url_queue.top();
 		url_queue.pop();
 
@@ -1686,7 +2150,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			now = std::chrono::steady_clock::now();
 		}
 
-		if (g_shutdown_requested) {
+		if (should_stop()) {
 			break;
 		}
 
@@ -1745,9 +2209,9 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			if (bind_data.log_skipped) {
 				std::string surt_key = GenerateSurtKey(entry.url);
 				auto insert_sql = "INSERT INTO " + bind_data.target_table +
-				                  " (url, surt_key, domain, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash) "
-				                  "VALUES ($1, $2, $3, $4, NULL, NULL, 0, NOW(), $5, NULL, NULL, NULL)";
-				auto insert_result = conn.Query(insert_sql, entry.url, surt_key, domain, -1, "robots.txt disallow");
+				                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash) "
+				                  "VALUES ($1, $2, $3, NULL, NULL, 0, NOW(), $4, NULL, NULL, NULL)";
+				auto insert_result = conn.Query(insert_sql, entry.url, surt_key, -1, "robots.txt disallow");
 				if (!insert_result->HasError()) {
 					rows_changed++;
 					RemoveFromQueue(conn, bind_data.target_table, entry.url);
@@ -1780,7 +2244,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			}
 		}
 
-		if (g_shutdown_requested) {
+		if (should_stop()) {
 			if (!domain_state.has_crawl_delay) {
 				domain_state.active_requests--;
 			}
@@ -1788,10 +2252,10 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		}
 
 		// Check global connection limit
-		while (g_active_connections >= bind_data.max_total_connections && !g_shutdown_requested) {
+		while (g_active_connections >= bind_data.max_total_connections && !should_stop()) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
-		if (g_shutdown_requested) {
+		if (should_stop()) {
 			if (!domain_state.has_crawl_delay) {
 				domain_state.active_requests--;
 			}
@@ -1882,7 +2346,6 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		result_batch.push_back(BatchCrawlEntry{
 			entry.url,
 			surt_key,
-			domain,
 			response.status_code,
 			response.body,
 			response.content_type,
@@ -1927,9 +2390,79 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 	output.SetValue(0, 0, Value::BIGINT(rows_changed));
 }
 
+//===--------------------------------------------------------------------===//
+// stop_crawl_internal - Used by STOP CRAWL INTO parser extension
+//===--------------------------------------------------------------------===//
+
+struct StopCrawlBindData : public TableFunctionData {
+	std::string target_table;
+};
+
+struct StopCrawlGlobalState : public GlobalTableFunctionState {
+	std::mutex mutex;
+	bool executed = false;
+
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> StopCrawlBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<StopCrawlBindData>();
+
+	if (input.inputs.size() >= 1) {
+		bind_data->target_table = StringValue::Get(input.inputs[0]);
+	}
+
+	// Return status message
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("status");
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> StopCrawlInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<StopCrawlGlobalState>();
+}
+
+static void StopCrawlFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->CastNoConst<StopCrawlBindData>();
+	auto &global_state = data.global_state->Cast<StopCrawlGlobalState>();
+
+	std::lock_guard<std::mutex> lock(global_state.mutex);
+
+	if (global_state.executed) {
+		output.SetCardinality(0);
+		return;
+	}
+	global_state.executed = true;
+
+	// Find and stop the background crawl
+	std::string status;
+	{
+		std::lock_guard<std::mutex> crawl_lock(g_background_crawls_mutex);
+		auto it = g_background_crawls.find(bind_data.target_table);
+		if (it != g_background_crawls.end()) {
+			auto &state = it->second;
+			if (state->running.load()) {
+				state->shutdown_requested = true;
+				status = "Stopping crawl into " + bind_data.target_table;
+			} else {
+				status = "No active crawl into " + bind_data.target_table;
+			}
+		} else {
+			status = "No crawl found for " + bind_data.target_table;
+		}
+	}
+
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value(status));
+}
+
 void RegisterCrawlIntoFunction(ExtensionLoader &loader) {
 	TableFunction crawl_into_func("crawl_into_internal",
-	                               {LogicalType::INTEGER,  // mode (0=URLS, 1=SITES)
+	                               {LogicalType::INTEGER,  // statement_type (0=CRAWL)
 	                                LogicalType::VARCHAR,  // source_query
 	                                LogicalType::VARCHAR,  // target_table
 	                                LogicalType::VARCHAR,  // user_agent
@@ -1948,10 +2481,23 @@ void RegisterCrawlIntoFunction(ExtensionLoader &loader) {
 	                                LogicalType::BIGINT,   // max_response_bytes
 	                                LogicalType::BOOLEAN,  // compress
 	                                LogicalType::VARCHAR,  // accept_content_types
-	                                LogicalType::VARCHAR}, // reject_content_types
+	                                LogicalType::VARCHAR,  // reject_content_types
+	                                LogicalType::BOOLEAN,  // follow_links
+	                                LogicalType::BOOLEAN,  // allow_subdomains
+	                                LogicalType::INTEGER,  // max_crawl_pages
+	                                LogicalType::INTEGER,  // max_crawl_depth
+	                                LogicalType::BOOLEAN,  // respect_nofollow
+	                                LogicalType::BOOLEAN}, // follow_canonical
 	                               CrawlIntoFunction, CrawlIntoBind, CrawlIntoInitGlobal);
 
 	loader.RegisterFunction(crawl_into_func);
+
+	// Register stop_crawl_internal function
+	TableFunction stop_crawl_func("stop_crawl_internal",
+	                               {LogicalType::VARCHAR},  // target_table
+	                               StopCrawlFunction, StopCrawlBind, StopCrawlInitGlobal);
+
+	loader.RegisterFunction(stop_crawl_func);
 }
 
 } // namespace duckdb

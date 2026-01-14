@@ -13,7 +13,7 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 unique_ptr<ParserExtensionParseData> CrawlParseData::Copy() const {
 	auto copy = make_uniq<CrawlParseData>();
-	copy->mode = mode;
+	copy->statement_type = statement_type;
 	copy->source_query = source_query;
 	copy->target_table = target_table;
 	copy->user_agent = user_agent;
@@ -33,12 +33,20 @@ unique_ptr<ParserExtensionParseData> CrawlParseData::Copy() const {
 	copy->compress = compress;
 	copy->accept_content_types = accept_content_types;
 	copy->reject_content_types = reject_content_types;
+	copy->follow_links = follow_links;
+	copy->allow_subdomains = allow_subdomains;
+	copy->max_crawl_pages = max_crawl_pages;
+	copy->max_crawl_depth = max_crawl_depth;
+	copy->respect_nofollow = respect_nofollow;
+	copy->follow_canonical = follow_canonical;
 	return copy;
 }
 
 string CrawlParseData::ToString() const {
-	string mode_str = (mode == CrawlMode::SITES) ? "CRAWL SITES" : "CRAWL";
-	return mode_str + " (" + source_query + ") INTO " + target_table;
+	if (statement_type == CrawlStatementType::STOP_CRAWL) {
+		return "STOP CRAWL INTO " + target_table;
+	}
+	return "CRAWL (" + source_query + ") INTO " + target_table;
 }
 
 //===--------------------------------------------------------------------===//
@@ -181,6 +189,18 @@ static bool ParseWithOptions(const string &options_str, CrawlParseData &data) {
 			data.accept_content_types = value;
 		} else if (key == "reject_content_types") {
 			data.reject_content_types = value;
+		} else if (key == "follow_links") {
+			data.follow_links = (StringUtil::Lower(value) == "true" || value == "1");
+		} else if (key == "allow_subdomains") {
+			data.allow_subdomains = (StringUtil::Lower(value) == "true" || value == "1");
+		} else if (key == "max_crawl_pages") {
+			data.max_crawl_pages = std::stoi(value);
+		} else if (key == "max_crawl_depth") {
+			data.max_crawl_depth = std::stoi(value);
+		} else if (key == "respect_nofollow") {
+			data.respect_nofollow = (StringUtil::Lower(value) == "true" || value == "1");
+		} else if (key == "follow_canonical") {
+			data.follow_canonical = (StringUtil::Lower(value) == "true" || value == "1");
 		}
 	}
 
@@ -196,9 +216,36 @@ CrawlParserExtension::CrawlParserExtension() {
 }
 
 ParserExtensionParseResult CrawlParserExtension::ParseCrawl(ParserExtensionInfo *info, const string &query) {
-	// Check if query starts with CRAWL (case-insensitive)
+	// Check if query starts with CRAWL or STOP (case-insensitive)
 	string trimmed = Trim(query);
 	string lower = StringUtil::Lower(trimmed);
+
+	// Handle STOP CRAWL INTO table_name
+	if (StringUtil::StartsWith(lower, "stop crawl")) {
+		auto data = make_uniq<CrawlParseData>();
+		data->statement_type = CrawlStatementType::STOP_CRAWL;
+
+		// Find INTO keyword
+		size_t into_pos = lower.find("into");
+		if (into_pos == string::npos) {
+			return ParserExtensionParseResult("STOP CRAWL syntax error: expected INTO table_name");
+		}
+
+		// Extract table name
+		string after_into = Trim(trimmed.substr(into_pos + 4));
+		// Remove trailing semicolon if present
+		if (!after_into.empty() && after_into.back() == ';') {
+			after_into.pop_back();
+			after_into = Trim(after_into);
+		}
+
+		if (after_into.empty()) {
+			return ParserExtensionParseResult("STOP CRAWL syntax error: table name is required");
+		}
+
+		data->target_table = after_into;
+		return ParserExtensionParseResult(std::move(data));
+	}
 
 	if (!StringUtil::StartsWith(lower, "crawl")) {
 		// Not a CRAWL statement, let default parser handle it
@@ -206,18 +253,12 @@ ParserExtensionParseResult CrawlParserExtension::ParseCrawl(ParserExtensionInfo 
 	}
 
 	auto data = make_uniq<CrawlParseData>();
+	data->statement_type = CrawlStatementType::CRAWL;
 
-	// Check for CRAWL SITES vs CRAWL
-	// Parse: CRAWL [SITES] (SELECT ...) INTO table_name WITH (options)
+	// Parse: CRAWL (SELECT ...) INTO table_name [WHERE ...] WITH (options)
 	size_t keyword_end = 5; // "crawl" length
-	if (StringUtil::StartsWith(lower, "crawl sites")) {
-		data->mode = CrawlMode::SITES;
-		keyword_end = 11; // "crawl sites" length
-	} else {
-		data->mode = CrawlMode::URLS;
-	}
 
-	// Find the opening parenthesis after CRAWL [SITES]
+	// Find the opening parenthesis after CRAWL
 	size_t paren_start = trimmed.find('(', keyword_end);
 	if (paren_start == string::npos) {
 		return ParserExtensionParseResult("CRAWL syntax error: expected '(' after CRAWL");
@@ -329,26 +370,40 @@ ParserExtensionParseResult CrawlParserExtension::ParseCrawl(ParserExtensionInfo 
 ParserExtensionPlanResult CrawlParserExtension::PlanCrawl(ParserExtensionInfo *info, ClientContext &context,
                                                           unique_ptr<ParserExtensionParseData> parse_data) {
 	auto &data = (CrawlParseData &)*parse_data;
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	ParserExtensionPlanResult result;
 
-	// The plan function returns a table function.
-	// Since CRAWL INTO needs to INSERT, we'll create a special "crawl_into" function
-	// that handles the insertion internally.
+	// Handle STOP CRAWL separately
+	if (data.statement_type == CrawlStatementType::STOP_CRAWL) {
+		auto catalog_entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, DEFAULT_SCHEMA,
+		                                       "stop_crawl_internal", OnEntryNotFound::THROW_EXCEPTION);
+		auto &table_function_catalog_entry = catalog_entry->Cast<TableFunctionCatalogEntry>();
+
+		if (table_function_catalog_entry.functions.functions.empty()) {
+			throw BinderException("STOP CRAWL: stop_crawl_internal function not found");
+		}
+
+		result.function = table_function_catalog_entry.functions.functions[0];
+		result.parameters.push_back(Value(data.target_table));
+		result.requires_valid_transaction = true;
+		result.return_type = StatementReturnType::CHANGED_ROWS;
+		return result;
+	}
 
 	// Look up the registered crawl_into_internal function from the catalog
-	auto &catalog = Catalog::GetSystemCatalog(context);
-	auto catalog_entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, DEFAULT_SCHEMA, "crawl_into_internal", OnEntryNotFound::THROW_EXCEPTION);
+	auto catalog_entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, DEFAULT_SCHEMA,
+	                                       "crawl_into_internal", OnEntryNotFound::THROW_EXCEPTION);
 	auto &table_function_catalog_entry = catalog_entry->Cast<TableFunctionCatalogEntry>();
 
-	// Get the actual function - it should only have one overload
 	if (table_function_catalog_entry.functions.functions.empty()) {
 		throw BinderException("CRAWL: crawl_into_internal function not found");
 	}
 
-	ParserExtensionPlanResult result;
 	result.function = table_function_catalog_entry.functions.functions[0];
 
 	// Pass all data as parameters
-	result.parameters.push_back(Value(static_cast<int32_t>(data.mode)));  // 0=URLS, 1=SITES
+	// statement_type: 0=CRAWL_CONCURRENTLY
+	result.parameters.push_back(Value(static_cast<int32_t>(data.statement_type)));
 	result.parameters.push_back(Value(data.source_query));
 	result.parameters.push_back(Value(data.target_table));
 	result.parameters.push_back(Value(data.user_agent));
@@ -368,6 +423,12 @@ ParserExtensionPlanResult CrawlParserExtension::PlanCrawl(ParserExtensionInfo *i
 	result.parameters.push_back(Value(data.compress));
 	result.parameters.push_back(Value(data.accept_content_types));
 	result.parameters.push_back(Value(data.reject_content_types));
+	result.parameters.push_back(Value(data.follow_links));
+	result.parameters.push_back(Value(data.allow_subdomains));
+	result.parameters.push_back(Value(data.max_crawl_pages));
+	result.parameters.push_back(Value(data.max_crawl_depth));
+	result.parameters.push_back(Value(data.respect_nofollow));
+	result.parameters.push_back(Value(data.follow_canonical));
 
 	result.requires_valid_transaction = true;
 	result.return_type = StatementReturnType::CHANGED_ROWS;

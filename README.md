@@ -4,8 +4,8 @@ A DuckDB extension for web crawling with automatic rate limiting, robots.txt com
 
 ## Features
 
-- **CRAWL SQL syntax** - Native SQL command for crawling
-- **Two modes**: Direct URL crawling or sitemap-based site discovery
+- **CRAWL SQL syntax** - Native non-blocking SQL command for crawling
+- **Automatic discovery** - Sitemap detection + link-following fallback
 - **robots.txt compliance** - Crawl-delay, Request-rate, Disallow/Allow rules
 - **Adaptive rate limiting** - Adjusts delay based on server response times
 - **Parallel sitemap discovery** - Fast site enumeration
@@ -14,7 +14,7 @@ A DuckDB extension for web crawling with automatic rate limiting, robots.txt com
 - **SURT key normalization** - Common Crawl compatible URL keys
 - **Crash recovery** - Persistent queue survives interruptions
 - **Progress tracking** - Monitor crawl status via `_crawl_progress_{table}`
-- **Graceful shutdown** - Ctrl+C stops cleanly, double Ctrl+C force exits
+- **Graceful shutdown** - Ctrl+C or `STOP CRAWL` stops cleanly
 
 ## Installation
 
@@ -25,30 +25,16 @@ LOAD crawler;
 
 ## Usage
 
-### CRAWL - Direct URL Crawling
+### CRAWL - Site Discovery & Crawling
 
 ```sql
--- Create target table (auto-created if doesn't exist)
-CRAWL (SELECT 'https://example.com/page1' AS url)
+-- Discover URLs from sitemap and crawl
+CRAWL (SELECT 'example.com')
 INTO crawl_results
 WITH (user_agent 'MyBot/1.0 (+https://example.com/bot)');
 
--- Crawl URLs from a table
-CRAWL (SELECT url FROM urls_to_crawl)
-INTO crawl_results
-WITH (user_agent 'MyBot/1.0');
-```
-
-### CRAWL SITES - Sitemap Discovery Mode
-
-```sql
--- Discover all URLs from sitemap and crawl them
-CRAWL SITES (SELECT 'example.com')
-INTO crawl_results
-WITH (user_agent 'MyBot/1.0');
-
 -- Filter discovered URLs with LIKE pattern
-CRAWL SITES (SELECT hostname FROM sites)
+CRAWL (SELECT hostname FROM sites)
 INTO products
 WHERE url LIKE '%/product/%'
 WITH (
@@ -57,10 +43,66 @@ WITH (
 );
 ```
 
+### Flexible Input Formats
+
+CRAWL accepts various input formats:
+
+```sql
+CRAWL (
+    SELECT input FROM (VALUES
+        -- Direct sitemap URL - fetched directly
+        ('https://example.com/sitemap.xml'),
+
+        -- Hostname only - robots.txt → bruteforce sitemaps → spider
+        ('example.com'),
+
+        -- Hostname with path - starts spider from /blog/ if no sitemap
+        ('example.com/blog/'),
+
+        -- Page URL - robots.txt → sitemaps → spider from this page
+        ('https://example.com/category/shoes?page=1')
+    ) t(input)
+)
+INTO results
+WITH (user_agent 'MyBot/1.0', follow_links true);
+```
+
+### Link-Following Fallback
+
+When a site has no sitemap, enable link-based discovery:
+
+```sql
+-- Crawl site by following links (no sitemap needed)
+CRAWL (SELECT 'example.com')
+INTO all_pages
+WITH (
+    user_agent 'MyBot/1.0',
+    follow_links true,
+    max_crawl_pages 1000,
+    max_crawl_depth 5
+);
+
+-- Start from specific path
+CRAWL (SELECT 'example.com/blog/')
+INTO blog_posts
+WITH (
+    user_agent 'BlogCrawler/1.0',
+    follow_links true,
+    allow_subdomains false
+);
+```
+
+### STOP CRAWL - Cancel Running Crawl
+
+```sql
+-- Stop a crawl in progress
+STOP CRAWL INTO crawl_results;
+```
+
 ### Full Example with Options
 
 ```sql
-CRAWL SITES (SELECT 'shop.example.com')
+CRAWL (SELECT 'shop.example.com')
 INTO product_pages
 WHERE url LIKE '%/products/%'
 WITH (
@@ -82,7 +124,6 @@ The target table is created automatically with this schema:
 |--------|------|-------------|
 | url | VARCHAR | Crawled URL |
 | surt_key | VARCHAR | SURT-normalized URL key (Common Crawl format) |
-| domain | VARCHAR | Domain extracted from URL |
 | http_status | INTEGER | HTTP status code (200, 404, etc.) or -1 for disallowed |
 | body | VARCHAR | Response body |
 | content_type | VARCHAR | Content-Type header |
@@ -114,6 +155,12 @@ The target table is created automatically with this schema:
 | compress | BOOLEAN | true | Request gzip/deflate compression |
 | accept_content_types | VARCHAR | '' | Only accept these types (comma-separated, e.g., 'text/html,text/*') |
 | reject_content_types | VARCHAR | '' | Reject these types |
+| follow_links | BOOLEAN | false | Enable link-based crawling when sitemap not found |
+| allow_subdomains | BOOLEAN | false | Follow links to subdomains |
+| max_crawl_pages | INTEGER | 10000 | Max pages to discover via link following |
+| max_crawl_depth | INTEGER | 10 | Max link depth from start URL |
+| respect_nofollow | BOOLEAN | true | Skip rel="nofollow" links |
+| follow_canonical | BOOLEAN | true | Follow canonical URLs |
 
 ## Auxiliary Tables
 
@@ -121,7 +168,8 @@ The extension creates helper tables automatically:
 
 - `_crawl_queue_{table}` - Persistent queue for crash recovery
 - `_crawl_progress_{table}` - Crawl progress and statistics
-- `_sitemap_cache` - Cached sitemap discovery results
+- `_crawl_sitemap_cache` - Cached sitemap URLs with lastmod/changefreq
+- `_crawl_sitemap_discovery_status` - Discovery method per hostname (sitemap/link_crawl/not_found)
 
 ### Monitor Progress
 
@@ -170,9 +218,9 @@ make release GEN=ninja
 LOAD 'build/release/extension/crawler/crawler.duckdb_extension';
 LOAD http_request;
 
-CRAWL (SELECT 'https://httpbin.org/html')
+CRAWL (SELECT 'httpbin.org')
 INTO test_results
-WITH (user_agent 'TestBot/1.0');
+WITH (user_agent 'TestBot/1.0', follow_links true, max_crawl_pages 5);
 
 SELECT url, http_status, length(body) as body_len FROM test_results;
 "

@@ -5,15 +5,15 @@
 
 namespace duckdb {
 
-// Crawl modes
-enum class CrawlMode : uint8_t {
-	URLS,   // Crawl specific URLs directly
-	SITES   // Discover sitemaps from hostnames and crawl all URLs found
+// Statement types for CRAWL parser
+enum class CrawlStatementType : uint8_t {
+	CRAWL,      // CRAWL (...) INTO table
+	STOP_CRAWL  // STOP CRAWL INTO table - stop a running crawl
 };
 
 // Parsed data from CRAWL statement
 struct CrawlParseData : public ParserExtensionParseData {
-	CrawlMode mode = CrawlMode::URLS;
+	CrawlStatementType statement_type = CrawlStatementType::CRAWL;
 	string source_query;      // The SELECT query for URLs or hostnames
 	string target_table;      // Table to insert results into
 	string user_agent;        // Required user_agent parameter
@@ -43,6 +43,14 @@ struct CrawlParseData : public ParserExtensionParseData {
 	// Content-Type filtering (comma-separated, supports wildcards like "text/*")
 	string accept_content_types;  // Only accept these types (empty = accept all)
 	string reject_content_types;  // Reject these types (checked after accept)
+
+	// Link-following fallback (when sitemap not found)
+	bool follow_links = false;            // Enable link-based crawling fallback
+	bool allow_subdomains = false;        // Follow links to subdomains (e.g., blog.example.com)
+	int max_crawl_pages = 10000;          // Safety limit on pages to discover
+	int max_crawl_depth = 10;             // Max link depth from start URL
+	bool respect_nofollow = true;         // Skip rel="nofollow" links and nofollow meta
+	bool follow_canonical = true;         // Replace URL with canonical if different
 
 	unique_ptr<ParserExtensionParseData> Copy() const override;
 	string ToString() const override;
