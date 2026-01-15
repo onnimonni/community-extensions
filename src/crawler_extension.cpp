@@ -3,6 +3,7 @@
 #include "crawler_extension.hpp"
 #include "crawler_function.hpp"
 #include "crawl_parser.hpp"
+#include "http_client.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -27,12 +28,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::DOUBLE,
 	                          Value(1.0));
 
-	// Try to install and load http_request from community (optional)
-	Connection conn(db);
-	auto install_result = conn.Query("INSTALL http_request FROM community");
-	if (!install_result->HasError()) {
-		conn.Query("LOAD http_request");
-	}
+	// Initialize HTTP client (libcurl with connection pooling)
+	InitializeHttpClient();
 
 	// Register crawl_urls() table function
 	RegisterCrawlerFunction(loader);

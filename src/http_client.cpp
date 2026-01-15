@@ -1,12 +1,83 @@
 #include "http_client.hpp"
-#include "duckdb/main/connection.hpp"
-#include "duckdb/common/string_util.hpp"
-#include <thread>
-#include <chrono>
-#include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <algorithm>
+#include <cctype>
 
 namespace duckdb {
+
+// Determine HTTP version at compile time based on available features
+#if defined(CRAWLER_HTTP3_SUPPORT) && CRAWLER_HTTP3_SUPPORT
+static constexpr long CRAWLER_HTTP_VERSION = CURL_HTTP_VERSION_3;
+static constexpr const char* CRAWLER_HTTP_VERSION_STR = "HTTP/3";
+#elif defined(CRAWLER_HTTP2_SUPPORT) && CRAWLER_HTTP2_SUPPORT
+static constexpr long CRAWLER_HTTP_VERSION = CURL_HTTP_VERSION_2TLS;
+static constexpr const char* CRAWLER_HTTP_VERSION_STR = "HTTP/2";
+#else
+static constexpr long CRAWLER_HTTP_VERSION = CURL_HTTP_VERSION_1_1;
+static constexpr const char* CRAWLER_HTTP_VERSION_STR = "HTTP/1.1";
+#endif
+
+// Global connection pool (singleton)
+static HttpConnectionPool* g_connection_pool = nullptr;
+
+HttpConnectionPool& GetConnectionPool() {
+	if (!g_connection_pool) {
+		g_connection_pool = new HttpConnectionPool();
+	}
+	return *g_connection_pool;
+}
+
+void InitializeHttpClient() {
+	curl_global_init(CURL_GLOBAL_DEFAULT);
+	// Initialize connection pool
+	GetConnectionPool();
+}
+
+void CleanupHttpClient() {
+	if (g_connection_pool) {
+		delete g_connection_pool;
+		g_connection_pool = nullptr;
+	}
+	curl_global_cleanup();
+}
+
+HttpConnectionPool::HttpConnectionPool() : initialized_(true) {
+}
+
+HttpConnectionPool::~HttpConnectionPool() {
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	for (CURL* handle : available_handles_) {
+		curl_easy_cleanup(handle);
+	}
+	available_handles_.clear();
+	initialized_ = false;
+}
+
+CURL* HttpConnectionPool::AcquireHandle() {
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	if (!available_handles_.empty()) {
+		CURL* handle = available_handles_.back();
+		available_handles_.pop_back();
+		curl_easy_reset(handle);  // Reset for reuse but keep connection alive
+		return handle;
+	}
+	return curl_easy_init();
+}
+
+void HttpConnectionPool::ReleaseHandle(CURL* handle) {
+	if (!handle) return;
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	if (initialized_ && available_handles_.size() < 100) {  // Max 100 pooled handles
+		available_handles_.push_back(handle);
+	} else {
+		curl_easy_cleanup(handle);
+	}
+}
+
+std::string HttpConnectionPool::GetHttpVersionString() {
+	return CRAWLER_HTTP_VERSION_STR;
+}
 
 bool HttpClient::IsRetryable(int status_code) {
 	// Network errors (connection failures)
@@ -37,154 +108,194 @@ int HttpClient::ParseRetryAfter(const std::string &retry_after) {
 	}
 }
 
-HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string &url,
+// Callback data structures
+struct WriteData {
+	std::string* body;
+};
+
+struct HeaderData {
+	std::string content_type;
+	std::string retry_after;
+	std::string server_date;
+	std::string etag;
+	std::string last_modified;
+	int64_t content_length = -1;
+};
+
+// Write callback for response body
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+	size_t total_size = size * nmemb;
+	WriteData* data = static_cast<WriteData*>(userp);
+	data->body->append(static_cast<char*>(contents), total_size);
+	return total_size;
+}
+
+// Helper to trim whitespace
+static std::string TrimString(const std::string& str) {
+	size_t start = str.find_first_not_of(" \t\r\n");
+	if (start == std::string::npos) return "";
+	size_t end = str.find_last_not_of(" \t\r\n");
+	return str.substr(start, end - start + 1);
+}
+
+// Helper to lowercase string
+static std::string ToLower(const std::string& str) {
+	std::string result = str;
+	std::transform(result.begin(), result.end(), result.begin(),
+	               [](unsigned char c) { return std::tolower(c); });
+	return result;
+}
+
+// Header callback for response headers
+static size_t HeaderCallback(char* buffer, size_t size, size_t nitems, void* userdata) {
+	size_t total_size = size * nitems;
+	HeaderData* headers = static_cast<HeaderData*>(userdata);
+
+	std::string header(buffer, total_size);
+
+	// Find colon separator
+	size_t colon_pos = header.find(':');
+	if (colon_pos != std::string::npos) {
+		std::string name = ToLower(TrimString(header.substr(0, colon_pos)));
+		std::string value = TrimString(header.substr(colon_pos + 1));
+
+		if (name == "content-type") {
+			headers->content_type = value;
+		} else if (name == "retry-after") {
+			headers->retry_after = value;
+		} else if (name == "date") {
+			headers->server_date = value;
+		} else if (name == "etag") {
+			headers->etag = value;
+		} else if (name == "last-modified") {
+			headers->last_modified = value;
+		} else if (name == "content-length") {
+			try {
+				headers->content_length = std::stoll(value);
+			} catch (...) {
+				headers->content_length = -1;
+			}
+		}
+	}
+
+	return total_size;
+}
+
+HttpResponse HttpClient::ExecuteHttpGet(const std::string &url,
                                          const std::string &user_agent, bool compress,
                                          const std::string &if_none_match, const std::string &if_modified_since) {
 	HttpResponse response;
 
-	Connection conn(db);
-
-	// Load http_request in this connection
-	auto load_result = conn.Query("LOAD http_request");
-	if (load_result->HasError()) {
-		response.error = "Failed to load http_request: " + load_result->GetError();
+	auto& pool = GetConnectionPool();
+	CURL* curl = pool.AcquireHandle();
+	if (!curl) {
+		response.error = "Failed to acquire curl handle";
 		return response;
 	}
 
-	// Escape URL for SQL
-	std::string escaped_url = StringUtil::Replace(url, "'", "''");
+	// Response data
+	std::string body;
+	WriteData write_data{&body};
+	HeaderData header_data;
 
-	// Build headers map
-	std::string headers_map = "{";
-	bool first_header = true;
+	// Set URL
+	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 
+	// Set HTTP version based on compile-time detection
+	curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CRAWLER_HTTP_VERSION);
+
+	// Set callbacks
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_data);
+	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+	curl_easy_setopt(curl, CURLOPT_HEADERDATA, &header_data);
+
+	// Set user agent
 	if (!user_agent.empty()) {
-		std::string escaped_ua = StringUtil::Replace(user_agent, "'", "''");
-		headers_map += "'User-Agent': '" + escaped_ua + "'";
-		first_header = false;
+		curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
 	}
 
+	// Enable compression
 	if (compress) {
-		if (!first_header) headers_map += ", ";
-		headers_map += "'Accept-Encoding': 'gzip, deflate'";
-		first_header = false;
+		curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "gzip, deflate");
 	}
 
-	// Add conditional request headers
+	// Set timeout (30 seconds)
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+
+	// Follow redirects
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+
+	// Build custom headers for conditional requests
+	struct curl_slist* custom_headers = nullptr;
 	if (!if_none_match.empty()) {
-		if (!first_header) headers_map += ", ";
-		std::string escaped_etag = StringUtil::Replace(if_none_match, "'", "''");
-		headers_map += "'If-None-Match': '" + escaped_etag + "'";
-		first_header = false;
+		std::string header = "If-None-Match: " + if_none_match;
+		custom_headers = curl_slist_append(custom_headers, header.c_str());
 	}
-
 	if (!if_modified_since.empty()) {
-		if (!first_header) headers_map += ", ";
-		std::string escaped_lm = StringUtil::Replace(if_modified_since, "'", "''");
-		headers_map += "'If-Modified-Since': '" + escaped_lm + "'";
-		first_header = false;
+		std::string header = "If-Modified-Since: " + if_modified_since;
+		custom_headers = curl_slist_append(custom_headers, header.c_str());
+	}
+	if (custom_headers) {
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, custom_headers);
 	}
 
-	headers_map += "}";
+	// Perform the request
+	CURLcode res = curl_easy_perform(curl);
 
-	// Build query - request headers to get Retry-After, Date, Content-Length, ETag, Last-Modified
-	std::string query;
-	if (headers_map != "{}") {
-		query = StringUtil::Format(
-		    "SELECT status, decode(body) AS body, "
-		    "content_type, "
-		    "headers['Retry-After'] AS retry_after, "
-		    "headers['Date'] AS server_date, "
-		    "headers['Content-Length'] AS content_length, "
-		    "headers['ETag'] AS etag, "
-		    "headers['Last-Modified'] AS last_modified "
-		    "FROM http_get('%s', headers := %s)",
-		    escaped_url, headers_map);
-	} else {
-		query = StringUtil::Format(
-		    "SELECT status, decode(body) AS body, "
-		    "content_type, "
-		    "headers['Retry-After'] AS retry_after, "
-		    "headers['Date'] AS server_date, "
-		    "headers['Content-Length'] AS content_length, "
-		    "headers['ETag'] AS etag, "
-		    "headers['Last-Modified'] AS last_modified "
-		    "FROM http_get('%s')",
-		    escaped_url);
-	}
+	// Get response info
+	if (res == CURLE_OK) {
+		long status_code;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+		response.status_code = static_cast<int>(status_code);
 
-	auto result = conn.Query(query);
+		// Get actual HTTP version used
+		long http_version;
+		curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &http_version);
+		response.http_version = http_version;
 
-	if (result->HasError()) {
-		response.error = result->GetError();
-		response.status_code = 0;
-		return response;
-	}
-
-	auto chunk = result->Fetch();
-	if (!chunk || chunk->size() == 0) {
-		response.error = "No response from HTTP request";
-		response.status_code = 0;
-		return response;
-	}
-
-	// Get status code
-	auto status_val = chunk->GetValue(0, 0);
-	response.status_code = status_val.IsNull() ? 0 : status_val.GetValue<int>();
-
-	// Get body
-	auto body_val = chunk->GetValue(1, 0);
-	response.body = body_val.IsNull() ? "" : body_val.GetValue<std::string>();
-
-	// Get content-type
-	auto ct_val = chunk->GetValue(2, 0);
-	response.content_type = ct_val.IsNull() ? "" : ct_val.GetValue<std::string>();
-
-	// Get retry-after
-	auto ra_val = chunk->GetValue(3, 0);
-	response.retry_after = ra_val.IsNull() ? "" : ra_val.GetValue<std::string>();
-
-	// Get server date
-	auto date_val = chunk->GetValue(4, 0);
-	response.server_date = date_val.IsNull() ? "" : date_val.GetValue<std::string>();
-
-	// Get content-length
-	auto cl_val = chunk->GetValue(5, 0);
-	if (!cl_val.IsNull()) {
-		try {
-			response.content_length = std::stoll(cl_val.GetValue<std::string>());
-		} catch (...) {
-			response.content_length = -1;
+		// Get redirect info
+		char* effective_url = nullptr;
+		curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+		if (effective_url) {
+			response.final_url = effective_url;
 		}
+		long redirect_count = 0;
+		curl_easy_getinfo(curl, CURLINFO_REDIRECT_COUNT, &redirect_count);
+		response.redirect_count = static_cast<int>(redirect_count);
+
+		response.body = std::move(body);
+		response.content_type = std::move(header_data.content_type);
+		response.retry_after = std::move(header_data.retry_after);
+		response.server_date = std::move(header_data.server_date);
+		response.etag = std::move(header_data.etag);
+		response.last_modified = std::move(header_data.last_modified);
+		response.content_length = header_data.content_length;
+
+		// 304 Not Modified is also considered success for conditional requests
+		response.success = (response.status_code >= 200 && response.status_code < 300) || response.status_code == 304;
+	} else {
+		response.error = curl_easy_strerror(res);
+		response.status_code = 0;
+		response.success = false;
 	}
 
-	// Get ETag
-	auto etag_val = chunk->GetValue(6, 0);
-	response.etag = etag_val.IsNull() ? "" : etag_val.GetValue<std::string>();
+	// Cleanup
+	if (custom_headers) {
+		curl_slist_free_all(custom_headers);
+	}
+	pool.ReleaseHandle(curl);
 
-	// Get Last-Modified
-	auto lm_val = chunk->GetValue(7, 0);
-	response.last_modified = lm_val.IsNull() ? "" : lm_val.GetValue<std::string>();
-
-	// 304 Not Modified is also considered success for conditional requests
-	response.success = (response.status_code >= 200 && response.status_code < 300) || response.status_code == 304;
 	return response;
 }
 
-HttpResponse HttpClient::Fetch(ClientContext &context, const std::string &url, const RetryConfig &config,
+HttpResponse HttpClient::Fetch(const std::string &url, const RetryConfig &config,
                                const std::string &user_agent, bool compress,
                                const std::string &if_none_match, const std::string &if_modified_since) {
-	auto &db = DatabaseInstance::GetDatabase(context);
-
 	// Single attempt - crawler handles all retries with Fibonacci backoff
-	return ExecuteHttpGet(db, url, user_agent, compress, if_none_match, if_modified_since);
-}
-
-HttpResponse HttpClient::Fetch(DatabaseInstance &db, const std::string &url, const RetryConfig &config,
-                               const std::string &user_agent, bool compress,
-                               const std::string &if_none_match, const std::string &if_modified_since) {
-	// Thread-safe overload - ExecuteHttpGet creates its own Connection
-	return ExecuteHttpGet(db, url, user_agent, compress, if_none_match, if_modified_since);
+	return ExecuteHttpGet(url, user_agent, compress, if_none_match, if_modified_since);
 }
 
 } // namespace duckdb

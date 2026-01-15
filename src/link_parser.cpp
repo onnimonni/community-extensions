@@ -417,4 +417,36 @@ bool LinkParser::HasNoFollowMeta(const std::string &html) {
 	return false;
 }
 
+bool LinkParser::HasNoIndexMeta(const std::string &html) {
+	// Look for <meta name="robots" content="...noindex...">
+	std::string lower_html = ToLower(html);
+
+	size_t pos = 0;
+	while (pos < lower_html.length()) {
+		size_t meta_start = lower_html.find("<meta", pos);
+		if (meta_start == std::string::npos) {
+			break;
+		}
+
+		size_t meta_end = html.find('>', meta_start);
+		if (meta_end == std::string::npos) {
+			break;
+		}
+
+		std::string tag = html.substr(meta_start, meta_end - meta_start + 1);
+		std::string name = ExtractAttribute(tag, "name");
+
+		if (ToLower(name) == "robots") {
+			std::string content = ExtractAttribute(tag, "content");
+			if (ToLower(content).find("noindex") != std::string::npos) {
+				return true;
+			}
+		}
+
+		pos = meta_end + 1;
+	}
+
+	return false;
+}
+
 } // namespace duckdb

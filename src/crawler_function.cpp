@@ -780,7 +780,7 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 		RetryConfig retry_config;
 		retry_config.max_retries = 2;
 
-		auto response = HttpClient::Fetch(context, robots_url, retry_config, bind_data.user_agent);
+		auto response = HttpClient::Fetch(robots_url, retry_config, bind_data.user_agent);
 
 		if (response.success) {
 			auto robots_data = RobotsParser::Parse(response.body);
@@ -858,7 +858,7 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 	RetryConfig retry_config;
 	retry_config.max_retries = 3;
 
-	auto response = HttpClient::Fetch(context, url, retry_config, bind_data.user_agent);
+	auto response = HttpClient::Fetch(url, retry_config, bind_data.user_agent);
 
 	auto fetch_end = std::chrono::steady_clock::now();
 	auto fetch_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fetch_end - fetch_start).count();
@@ -1300,6 +1300,8 @@ struct BatchCrawlEntry {
 	std::string etag;
 	std::string last_modified;
 	std::string content_hash;
+	std::string final_url;       // Final URL after redirects
+	int redirect_count;          // Number of redirects followed
 	bool is_update;
 };
 
@@ -1317,7 +1319,8 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			auto update_sql = "UPDATE " + target_table +
 			                  " SET surt_key = $2, http_status = $3, body = $4, content_type = $5, "
 			                  "elapsed_ms = $6, crawled_at = " + result.timestamp_expr + ", error = $7, "
-			                  "etag = $8, last_modified = $9, content_hash = $10 "
+			                  "etag = $8, last_modified = $9, content_hash = $10, "
+			                  "final_url = $11, redirect_count = $12 "
 			                  "WHERE url = $1";
 
 			auto update_result = conn.Query(update_sql, result.url, result.surt_key, result.status_code,
@@ -1327,15 +1330,17 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			                                 result.error.empty() ? Value() : Value(result.error),
 			                                 result.etag.empty() ? Value() : Value(result.etag),
 			                                 result.last_modified.empty() ? Value() : Value(result.last_modified),
-			                                 result.content_hash.empty() ? Value() : Value(result.content_hash));
+			                                 result.content_hash.empty() ? Value() : Value(result.content_hash),
+			                                 result.final_url.empty() ? Value() : Value(result.final_url),
+			                                 result.redirect_count);
 
 			if (!update_result->HasError()) {
 				rows_changed++;
 			}
 		} else {
 			auto insert_sql = "INSERT INTO " + target_table +
-			                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash) "
-			                  "VALUES ($1, $2, $3, $4, $5, $6, " + result.timestamp_expr + ", $7, $8, $9, $10)";
+			                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash, final_url, redirect_count) "
+			                  "VALUES ($1, $2, $3, $4, $5, $6, " + result.timestamp_expr + ", $7, $8, $9, $10, $11, $12)";
 
 			auto insert_result = conn.Query(insert_sql, result.url, result.surt_key, result.status_code,
 			                                 result.body.empty() ? Value() : Value(result.body),
@@ -1344,7 +1349,9 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			                                 result.error.empty() ? Value() : Value(result.error),
 			                                 result.etag.empty() ? Value() : Value(result.etag),
 			                                 result.last_modified.empty() ? Value() : Value(result.last_modified),
-			                                 result.content_hash.empty() ? Value() : Value(result.content_hash));
+			                                 result.content_hash.empty() ? Value() : Value(result.content_hash),
+			                                 result.final_url.empty() ? Value() : Value(result.final_url),
+			                                 result.redirect_count);
 
 			if (!insert_result->HasError()) {
 				rows_changed++;
@@ -1371,7 +1378,9 @@ static void EnsureTargetTable(Connection &conn, const std::string &target_table)
 	           "etag VARCHAR, "
 	           "last_modified VARCHAR, "
 	           "content_hash VARCHAR, "
-	           "error_type VARCHAR)");
+	           "error_type VARCHAR, "
+	           "final_url VARCHAR, "
+	           "redirect_count INTEGER)");
 }
 
 // Input type for CRAWL SITES
@@ -1557,7 +1566,7 @@ static std::vector<std::string> DiscoverUrlsViaLinks(
 		}
 
 		// Fetch page
-		auto response = HttpClient::Fetch(db, url, retry_config, user_agent);
+		auto response = HttpClient::Fetch(url, retry_config, user_agent);
 		domain_state.last_crawl_time = std::chrono::steady_clock::now();
 
 		if (!response.success || response.status_code != 200) {
@@ -1696,7 +1705,7 @@ static SitemapDiscoveryResult DiscoverSitemapUrlsThreadSafe(DatabaseInstance &db
 
 	// Step 1: Always fetch robots.txt for rate limiting (even for direct sitemap URLs)
 	std::string robots_url = "https://" + parsed.hostname + "/robots.txt";
-	auto robots_response = HttpClient::Fetch(db, robots_url, retry_config, user_agent);
+	auto robots_response = HttpClient::Fetch(robots_url, retry_config, user_agent);
 
 	if (robots_response.success) {
 		// Parse robots rules for rate limiting
@@ -1740,7 +1749,7 @@ static SitemapDiscoveryResult DiscoverSitemapUrlsThreadSafe(DatabaseInstance &db
 		}
 		processed_sitemaps.insert(sitemap_url);
 
-		auto response = HttpClient::Fetch(db, sitemap_url, retry_config, user_agent);
+		auto response = HttpClient::Fetch(sitemap_url, retry_config, user_agent);
 		if (!response.success || response.status_code != 200) {
 			continue;
 		}
@@ -1834,7 +1843,7 @@ static std::vector<std::string> DiscoverSitemapUrls(ClientContext &context, Conn
 
 	// Step 1: Try robots.txt for Sitemap directives
 	std::string robots_url = "https://" + hostname + "/robots.txt";
-	auto robots_response = HttpClient::Fetch(context, robots_url, retry_config, user_agent);
+	auto robots_response = HttpClient::Fetch(robots_url, retry_config, user_agent);
 
 	if (robots_response.success) {
 		auto sitemaps_from_robots = SitemapParser::ExtractSitemapsFromRobotsTxt(robots_response.body);
@@ -1875,7 +1884,7 @@ static std::vector<std::string> DiscoverSitemapUrls(ClientContext &context, Conn
 		}
 		processed_sitemaps.insert(sitemap_url);
 
-		auto response = HttpClient::Fetch(context, sitemap_url, retry_config, user_agent);
+		auto response = HttpClient::Fetch(sitemap_url, retry_config, user_agent);
 		if (!response.success || response.status_code != 200) {
 			continue;
 		}
@@ -2158,7 +2167,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			std::string robots_url = "https://" + domain + "/robots.txt";
 			RetryConfig retry_config;
 
-			auto response = HttpClient::Fetch(context, robots_url, retry_config, bind_data.user_agent);
+			auto response = HttpClient::Fetch(robots_url, retry_config, bind_data.user_agent);
 
 			if (response.success) {
 				auto robots_data = RobotsParser::Parse(response.body);
@@ -2191,8 +2200,8 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			if (bind_data.log_skipped) {
 				std::string surt_key = GenerateSurtKey(entry.url);
 				auto insert_sql = "INSERT INTO " + bind_data.target_table +
-				                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash) "
-				                  "VALUES ($1, $2, $3, NULL, NULL, 0, NOW(), $4, NULL, NULL, NULL)";
+				                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash, final_url, redirect_count) "
+				                  "VALUES ($1, $2, $3, NULL, NULL, 0, NOW(), $4, NULL, NULL, NULL, NULL, 0)";
 				auto insert_result = conn.Query(insert_sql, entry.url, surt_key, -1, "robots.txt disallow");
 				if (!insert_result->HasError()) {
 					rows_changed++;
@@ -2244,7 +2253,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		g_active_connections++;
 		auto fetch_start = std::chrono::steady_clock::now();
 		RetryConfig retry_config;
-		auto response = HttpClient::Fetch(context, entry.url, retry_config, bind_data.user_agent, bind_data.compress);
+		auto response = HttpClient::Fetch(entry.url, retry_config, bind_data.user_agent, bind_data.compress);
 		auto fetch_end = std::chrono::steady_clock::now();
 		auto fetch_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fetch_end - fetch_start).count();
 		g_active_connections--;
@@ -2270,6 +2279,14 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			response.success = false;
 			response.error = "Content-Type rejected: " + response.content_type;
 			response.body.clear();  // Don't store rejected content
+		}
+
+		// Check for meta robots noindex (only for HTML content)
+		// Respects <meta name="robots" content="noindex"> by not storing body
+		if (response.success && bind_data.respect_robots_txt &&
+		    response.content_type.find("text/html") != std::string::npos &&
+		    LinkParser::HasNoIndexMeta(response.body)) {
+			response.body.clear();  // Don't store noindex content, but keep metadata
 		}
 
 		// Check for retryable errors (429, 5XX, network errors)
@@ -2332,6 +2349,8 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			response.etag,
 			response.last_modified,
 			content_hash,
+			response.final_url,
+			response.redirect_count,
 			entry.is_update
 		});
 

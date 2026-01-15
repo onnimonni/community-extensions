@@ -25,6 +25,9 @@ public:
 	// Check for <meta name="robots" content="nofollow">
 	static bool HasNoFollowMeta(const std::string &html);
 
+	// Check for <meta name="robots" content="noindex">
+	static bool HasNoIndexMeta(const std::string &html);
+
 	// Check if URL belongs to same domain (or allowed subdomain)
 	static bool IsSameDomain(const std::string &url, const std::string &base_domain, bool allow_subdomains);
 
