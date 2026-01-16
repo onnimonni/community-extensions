@@ -1,22 +1,94 @@
-# Known Issues and Workarounds
+# Known Limitations - JS Variables Extractor
 
-## CPPHTTPLIB_HEADER_MAX_LENGTH too small
+The `js_variables_extractor.cpp` uses a simple string-based parser instead of a full JavaScript AST parser (like tree-sitter). This handles ~95% of real-world cases but has known limitations.
 
-**Issue**: DuckDB's httplib has a default header max length that can cause issues with some sites (e.g., lidl.fi). See https://github.com/duckdb/duckdb/pull/20460
+## What Works
 
-**Workaround**: For debug builds, define `CPPHTTPLIB_HEADER_MAX_LENGTH=16384` to increase the header buffer size.
+Simple JSON assignments that most e-commerce/data sites use:
 
-**Status**: Awaiting upstream fix in DuckDB.
+```javascript
+var productData = {"name": "Widget", "price": 19.99};
+window.__INITIAL_STATE__ = {"products": [...]};
+let config = {"apiUrl": "https://..."};
+const APP_DATA = [{"id": 1}, {"id": 2}];
+```
 
-## "Unaligned fetch in validity and main column data for update" crash
+## What Doesn't Work
 
-**Issue**: Internal DuckDB error during UPDATE operations affecting column validity (NULL/non-NULL transitions).
+### 1. Regex literals containing `{}`
 
-**Cause**: DuckDB bug #16836 - during CHECKPOINT, validity changes weren't being properly synchronized with column data.
+```javascript
+var pattern = /\{[a-z]+\}/;  // Parser sees { and tries to extract JSON
+var data = {"valid": true};   // May get confused by earlier regex
+```
 
-**Fix**: Fixed in DuckDB v1.2.2 (PR #16851). Current DuckDB v1.4.3 includes this fix.
+**Workaround:** None. Regex literals look like division operators to simple parsers.
 
-**If you still see this error**:
-1. Ensure you're using DuckDB v1.2.2 or later
-2. The crash may be caused by the httplib header length issue above (connection failures during crawl)
-3. Try reducing `max_parallel_per_domain` to 1
+### 2. Template literals with `${}`
+
+```javascript
+const config = `prefix${someVar}suffix`;  // Backtick strings with ${}
+var data = {"key": "value"};              // Might misparse
+```
+
+**Status:** Partially handled - backtick strings are preserved during comment stripping, but `${}` expressions inside may confuse bracket matching.
+
+### 3. ~~Comments containing JSON-like syntax~~ FIXED
+
+```javascript
+// var oldData = {"deleted": true};
+var data = {"active": true};
+```
+
+**Status:** Fixed. Comments are stripped before parsing.
+
+### 4. Calculated/dynamic values (impossible without execution)
+
+```javascript
+var config = JSON.parse('{"a":1}');      // Can't get the object
+var data = Object.assign({}, defaults);  // Can't resolve
+var merged = {...base, ...extra};        // Spread operator
+const x = require('./config.json');      // Module import
+```
+
+**Workaround:** None without JavaScript execution (would need QuickJS/Boa).
+
+### 5. Destructuring assignments (false positives)
+
+```javascript
+const {name, value} = someObject;  // Not a JSON assignment, but looks like one
+```
+
+**Status:** Usually rejected by yyjson validation since `{name, value}` isn't valid JSON.
+
+### 6. Multi-declaration statements
+
+```javascript
+var a = 1, b = {"key": "value"}, c = 3;  // Only first value checked
+```
+
+**Workaround:** None. Parser only looks at first assignment.
+
+### 7. Non-standard JS (minified edge cases)
+
+```javascript
+var a={"x":1},b={"y":2}  // No spaces, multiple vars
+!function(){var x={"z":3}}()  // IIFE patterns
+```
+
+**Status:** May work depending on exact formatting.
+
+## Why Not tree-sitter?
+
+Tree-sitter would solve all parsing issues but:
+1. vcpkg's tree-sitter doesn't include JavaScript grammar
+2. Grammar files need internal headers not distributed in vcpkg
+3. Would add ~3MB to binary size
+4. Overkill for extracting simple JSON assignments
+
+## Future Improvements
+
+If these limitations become blocking:
+1. **Quick fix:** Add regex literal detection (skip `/...../` patterns)
+2. **Medium fix:** Use QuickJS to actually execute and inspect globals
+3. **Full fix:** Bundle tree-sitter + tree-sitter-javascript (~3MB)

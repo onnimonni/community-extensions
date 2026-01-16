@@ -32,6 +32,69 @@ static yyjson_doc* TryParseJson(const std::string &json) {
 	                   YYJSON_READ_ALLOW_TRAILING_COMMAS | YYJSON_READ_ALLOW_COMMENTS);
 }
 
+// Strip JavaScript comments while preserving strings
+// Handles // single-line and /* multi-line */ comments
+static std::string StripComments(const std::string &script) {
+	std::string result;
+	result.reserve(script.size());
+
+	size_t i = 0;
+	while (i < script.size()) {
+		// Check for string start
+		if (script[i] == '"' || script[i] == '\'' || script[i] == '`') {
+			char quote = script[i];
+			result += script[i++];
+
+			// Copy string content, handling escapes
+			while (i < script.size()) {
+				if (script[i] == '\\' && i + 1 < script.size()) {
+					result += script[i++];
+					result += script[i++];
+				} else if (script[i] == quote) {
+					result += script[i++];
+					break;
+				} else {
+					result += script[i++];
+				}
+			}
+			continue;
+		}
+
+		// Check for single-line comment
+		if (i + 1 < script.size() && script[i] == '/' && script[i + 1] == '/') {
+			// Skip until end of line
+			while (i < script.size() && script[i] != '\n') {
+				i++;
+			}
+			// Keep the newline for statement boundary detection
+			if (i < script.size()) {
+				result += '\n';
+				i++;
+			}
+			continue;
+		}
+
+		// Check for multi-line comment
+		if (i + 1 < script.size() && script[i] == '/' && script[i + 1] == '*') {
+			i += 2;
+			// Skip until */
+			while (i + 1 < script.size() && !(script[i] == '*' && script[i + 1] == '/')) {
+				i++;
+			}
+			if (i + 1 < script.size()) {
+				i += 2; // Skip */
+			}
+			// Add space to preserve token boundaries
+			result += ' ';
+			continue;
+		}
+
+		result += script[i++];
+	}
+
+	return result;
+}
+
 // Extract JSON object/array starting from position
 // Returns empty string if not valid JSON
 static std::string ExtractJsonValue(const std::string &content, size_t start_pos) {
@@ -176,7 +239,9 @@ static std::pair<std::string, size_t> ExtractAssignment(const std::string &scrip
 }
 
 // Find all variable assignments in script content
-static void ExtractVariablesFromScript(const std::string &script, JsVariablesResult &result) {
+static void ExtractVariablesFromScript(const std::string &raw_script, JsVariablesResult &result) {
+	// Strip comments first to avoid false positives from commented-out code
+	std::string script = StripComments(raw_script);
 	size_t pos = 0;
 
 	while (pos < script.size()) {
