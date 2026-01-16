@@ -10,11 +10,33 @@ enum class CrawlStatementType : uint8_t {
 	CRAWL      // CRAWL (...) INTO table
 };
 
+// Extraction source types
+enum class ExtractSource : uint8_t {
+	JSONLD,
+	MICRODATA,
+	OPENGRAPH,
+	META,
+	JS,
+	CSS
+};
+
 // Specification for a single EXTRACT column
 struct ExtractSpec {
-	string expression;  // e.g., "jsonld->'Product'->>'name'"
-	string alias;       // e.g., "name"
-	bool is_text;       // true for ->> (text), false for -> (json)
+	string expression;     // e.g., "jsonld.Product.name" or "css '.price::text'"
+	string alias;          // e.g., "name"
+	bool is_text;          // true for ->> (text), false for -> (json)
+
+	// Enhanced fields for new syntax
+	ExtractSource source;  // Source type
+	string path;           // Path within source (dot notation)
+	string target_type;    // Optional type: DECIMAL, INTEGER, BOOLEAN, VARCHAR
+	string transform;      // Optional transform: parse_price, trim, lowercase
+
+	// For COALESCE
+	bool is_coalesce;      // true if this is a COALESCE expression
+	vector<string> coalesce_paths;  // Paths for COALESCE (source.path format)
+
+	ExtractSpec() : is_text(false), source(ExtractSource::JSONLD), is_coalesce(false) {}
 };
 
 // Parsed data from CRAWL statement
@@ -60,6 +82,9 @@ struct CrawlParseData : public ParserExtensionParseData {
 
 	// Multi-threading
 	int num_threads = 0;                  // 0 = auto (hardware_concurrency)
+
+	// Row limit (LIMIT clause) - stops crawl after N matching rows inserted
+	int64_t row_limit = 0;                // 0 = no limit
 
 	// Structured data extraction
 	bool extract_js = true;               // Extract JS variables (can be disabled for performance)

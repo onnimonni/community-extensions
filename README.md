@@ -1,235 +1,647 @@
 # DuckDB Crawler Extension
 
-A DuckDB extension for web crawling with automatic rate limiting, robots.txt compliance, and sitemap discovery.
+A high-performance web crawler extension for DuckDB that fetches web pages, extracts structured data from HTML, and stores results directly in database tables.
 
 ## Features
 
-- **CRAWL SQL syntax** - Native non-blocking SQL command for crawling
-- **Automatic discovery** - Sitemap detection + link-following fallback
-- **robots.txt compliance** - Crawl-delay, Request-rate, Disallow/Allow rules
-- **Adaptive rate limiting** - Adjusts delay based on server response times
-- **Parallel sitemap discovery** - Fast site enumeration
-- **Conditional requests** - ETag/Last-Modified support for efficient re-crawling
-- **Content deduplication** - SHA-256 content hash
-- **SURT key normalization** - Common Crawl compatible URL keys
-- **Sitemap caching** - SURT-indexed cache for fast domain lookups
-- **Progress bar** - Built-in DuckDB progress tracking
-- **Graceful shutdown** - Ctrl+C or `STOP CRAWL` stops cleanly
+- **Native SQL syntax** - `CRAWL` statement integrates seamlessly with DuckDB
+- **HTTP/1.1, HTTP/2, HTTP/3** support via libcurl
+- **Parallel crawling** with configurable thread pools
+- **robots.txt compliance** with crawl delay respect
+- **Sitemap discovery** and parsing (XML, gzip)
+- **Structured data extraction**:
+  - JSON-LD (with @graph support)
+  - Microdata (schema.org HTML attributes)
+  - OpenGraph meta tags
+  - CSS selectors
+  - JavaScript variables (AST-based via tree-sitter)
+- **EXTRACT clause** - Pull specific fields during crawl
+- **Predicate pushdown** - Filter URLs before fetching
+- **Rate limiting** per domain with adaptive backoff
+- **Link following** with depth control
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         CRAWL Statement                         │
+│  CRAWL (SELECT urls) INTO table EXTRACT (...) WHERE ... WITH   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    DuckDB Parser Extension                      │
+│  Parses CRAWL/INTO/EXTRACT/WHERE/WITH into execution plan      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Crawler Thread Pool                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │ Worker 1 │  │ Worker 2 │  │ Worker 3 │  │ Worker N │       │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
+│       │             │             │             │              │
+│       ▼             ▼             ▼             ▼              │
+│  ┌─────────────────────────────────────────────────────┐      │
+│  │              libcurl (HTTP Client)                   │      │
+│  │    HTTP/1.1 · HTTP/2 · HTTP/3 · TLS · Keep-Alive    │      │
+│  │    Connection pooling · Compression · Redirects     │      │
+│  └─────────────────────────────────────────────────────┘      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   HTML Parser (Rust FFI)                        │
+│  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌─────────────┐    │
+│  │  JSON-LD  │ │ Microdata │ │    CSS    │ │ JS Variables│    │
+│  │ (yyjson)  │ │ (scraper) │ │ (scraper) │ │(tree-sitter)│    │
+│  └───────────┘ └───────────┘ └───────────┘ └─────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      EXTRACT Evaluation                         │
+│  Dot notation · COALESCE · Type coercion · Transforms          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        DuckDB Table                             │
+│  url | status | body | jsonld | microdata | extracted_* | ...  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## How It Works
+
+### 1. URL Discovery
+
+The crawler starts with seed URLs from the subquery:
+
+```sql
+CRAWL (SELECT 'https://example.com/sitemap.xml')  -- Direct URLs
+CRAWL (SELECT url FROM my_urls)                    -- From table
+CRAWL (SELECT 'example.com')                       -- Auto-discover sitemap
+```
+
+If `follow_links` is enabled, it parses HTML for `<a href>` links and adds them to the queue, respecting `max_crawl_depth` and same-domain rules.
+
+### 2. HTTP Fetching (libcurl)
+
+Each URL is fetched using libcurl with:
+
+- **Connection pooling** - Reuses TCP connections for same hosts
+- **Keep-alive** - Maintains persistent connections
+- **HTTP/2 multiplexing** - Multiple requests over single connection
+- **HTTP/3 QUIC** - UDP-based transport when available
+- **Automatic decompression** - gzip, deflate, brotli
+- **Redirect following** - Configurable limit
+- **TLS verification** - Certificate validation
+- **Timeout handling** - Connect and read timeouts
+
+### 3. HTML Parsing (Rust)
+
+The Rust HTML parser processes each response:
+
+**JSON-LD Extraction:**
+- Finds all `<script type="application/ld+json">` tags
+- Parses JSON content with error tolerance
+- Handles `@graph` arrays (multiple objects)
+- Indexes results by `@type` for easy access
+
+**Microdata Extraction:**
+- Traverses DOM for `itemscope` attributes
+- Builds nested objects from `itemprop` values
+- Handles nested itemscopes (e.g., Product > Offer)
+- Extracts values from appropriate HTML attributes
+
+**CSS Selector Extraction:**
+- Uses `scraper` crate (built on `html5ever`)
+- Supports full CSS3 selectors
+- Extracts text, attributes, or HTML content
+
+**JavaScript Variable Extraction:**
+- Uses `tree-sitter` to build AST of script contents
+- Extracts `var`/`let`/`const` declarations
+- Captures `window.X = {...}` assignments
+- Parses object/array literal values to JSON
+
+### 4. EXTRACT Evaluation
+
+EXTRACT expressions are evaluated against parsed data:
+
+```sql
+EXTRACT (
+    jsonld.Product.name,                    -- Dot notation path
+    COALESCE(jsonld.gtin, microdata.gtin),  -- First non-null
+    price DECIMAL FROM css '.price' | parse_price  -- CSS + transform
+)
+```
+
+- **Path traversal** - Navigates nested JSON structures
+- **COALESCE** - Tries sources in order until non-null found
+- **Transforms** - String processing (trim, parse_price, etc.)
+- **Type coercion** - Converts to DECIMAL, INTEGER, BOOLEAN
+
+### 5. Storage
+
+Results are batch-inserted into the target DuckDB table:
+
+- Table created automatically if not exists
+- Schema includes standard columns + EXTRACT aliases
+- Efficient batch inserts (configurable batch size)
+- Transaction per batch for consistency
 
 ## Installation
 
-```sql
-INSTALL crawler FROM community;
-LOAD crawler;
+```bash
+# Build from source (requires Rust toolchain)
+git clone https://github.com/user/duckdb-crawler
+cd duckdb-crawler
+./vcpkg/bootstrap-vcpkg.sh
+make release VCPKG_TOOLCHAIN_PATH=$(pwd)/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+# Load in DuckDB
+LOAD 'build/release/extension/crawler/crawler.duckdb_extension';
 ```
 
-## Usage
-
-### CRAWL - Site Discovery & Crawling
+## Quick Start
 
 ```sql
--- Discover URLs from sitemap and crawl
-CRAWL (SELECT 'example.com')
-INTO crawl_results
-WITH (user_agent 'MyBot/1.0 (+https://example.com/bot)');
+LOAD 'build/release/extension/crawler/crawler.duckdb_extension';
 
--- Filter discovered URLs with LIKE pattern
-CRAWL (SELECT hostname FROM sites)
-INTO products
-WHERE url LIKE '%/product/%'
-WITH (
-    user_agent 'ProductBot/1.0',
-    sitemap_cache_hours 48
-);
+-- Simple crawl
+CRAWL (SELECT 'https://example.com/')
+INTO pages
+WITH (max_crawl_pages 10);
+
+-- View results
+SELECT url, status_code, length(body) as size FROM pages;
 ```
 
-### Flexible Input Formats
-
-CRAWL accepts various input formats:
+## CRAWL Statement Syntax
 
 ```sql
-CRAWL (
-    SELECT input FROM (VALUES
-        -- Direct sitemap URL - fetched directly
-        ('https://example.com/sitemap.xml'),
+CRAWL (subquery)
+INTO table_name
+[EXTRACT (extraction_specs)]
+[WHERE url_filter]
+[WITH (options)]
+[LIMIT n]
+```
 
-        -- Hostname only - robots.txt → bruteforce sitemaps → spider
-        ('example.com'),
+### Components
 
-        -- Hostname with path - starts spider from /blog/ if no sitemap
-        ('example.com/blog/'),
+| Clause | Required | Description |
+|--------|----------|-------------|
+| `CRAWL (subquery)` | Yes | Source URLs - any SELECT returning URL strings |
+| `INTO table_name` | Yes | Target table (created if not exists) |
+| `EXTRACT (...)` | No | Fields to extract from HTML |
+| `WHERE condition` | No | URL filter applied before fetching |
+| `WITH (options)` | No | Crawler configuration |
+| `LIMIT n` | No | Maximum pages to crawl |
 
-        -- Page URL - robots.txt → sitemaps → spider from this page
-        ('https://example.com/category/shoes?page=1')
-    ) t(input)
+## EXTRACT Syntax
+
+The EXTRACT clause specifies structured data to pull from HTML pages during crawling. This eliminates the need for post-processing queries.
+
+### Basic Syntax
+
+```sql
+EXTRACT (
+    source.path as alias,
+    source.path.to.nested.field,
+    COALESCE(source1.path, source2.path) as fallback_field,
+    alias TYPE FROM source 'selector' | transform
 )
-INTO results
-WITH (user_agent 'MyBot/1.0', follow_links true);
 ```
 
-### Link-Following Fallback
+### Data Sources
 
-When a site has no sitemap, enable link-based discovery:
+| Source | Description | Example |
+|--------|-------------|---------|
+| `jsonld` | JSON-LD from `<script type="application/ld+json">` | `jsonld.Product.name` |
+| `microdata` | Schema.org from `itemscope`/`itemprop` | `microdata.Product.gtin` |
+| `og` | OpenGraph meta tags | `og.title`, `og.image` |
+| `meta` | Standard meta tags | `meta.description` |
+| `js` | JavaScript variables | `js.siteConfig.price` |
+| `css` | CSS selector extraction | `css '.price::text'` |
+
+### Dot Notation
+
+Access nested JSON fields using dots:
 
 ```sql
--- Crawl site by following links (no sitemap needed)
-CRAWL (SELECT 'example.com')
-INTO all_pages
-WITH (
-    user_agent 'MyBot/1.0',
-    follow_links true,
-    max_crawl_pages 1000,
-    max_crawl_depth 5
-);
+EXTRACT (
+    -- Simple field
+    jsonld.Product.name,
 
--- Start from specific path
-CRAWL (SELECT 'example.com/blog/')
-INTO blog_posts
-WITH (
-    user_agent 'BlogCrawler/1.0',
-    follow_links true,
-    allow_subdomains false
-);
+    -- Nested objects
+    jsonld.Product.offers.price,
+    jsonld.Product.brand.name,
+
+    -- From different sources
+    microdata.Product.gtin,
+    og.title,
+    og.image,
+    meta.description
+)
 ```
 
-### STOP CRAWL - Cancel Running Crawl
+### Array Access
+
+Access array elements with bracket notation:
 
 ```sql
--- Stop a crawl in progress
-STOP CRAWL INTO crawl_results;
+EXTRACT (
+    jsonld.Product.image[0] as main_image,
+    jsonld.Product.offers[0].price as first_price,
+    jsonld.ItemList.itemListElement[0].item.name as first_item
+)
 ```
 
-### Full Example with Options
+### COALESCE - Fallback Values
+
+Try multiple sources, use first non-null value:
 
 ```sql
-CRAWL (SELECT 'shop.example.com')
-INTO product_pages
-WHERE url LIKE '%/products/%'
+EXTRACT (
+    -- Try JSON-LD first, fall back to microdata
+    COALESCE(jsonld.Product.gtin13, jsonld.Product.gtin, microdata.Product.gtin) as gtin,
+
+    -- Try structured data, fall back to meta tags
+    COALESCE(jsonld.Product.name, og.title, meta.title) as name,
+
+    -- Mix sources freely
+    COALESCE(jsonld.Product.offers.price, microdata.Offer.price, js.productPrice) as price
+)
+```
+
+### CSS Selectors
+
+Extract content using CSS selectors with pseudo-elements:
+
+```sql
+EXTRACT (
+    -- Text content
+    css '.product-title::text' as title,
+    css 'h1.name::text' as heading,
+
+    -- Attribute values
+    css 'img.product::attr(src)' as image_url,
+    css 'a.buy-button::attr(href)' as buy_link,
+
+    -- Outer HTML (default)
+    css 'div.description' as description_html
+)
+```
+
+**Pseudo-elements:**
+| Pseudo | Description |
+|--------|-------------|
+| `::text` | Extract text content (strips HTML tags) |
+| `::attr(name)` | Extract attribute value |
+| (none) | Extract outer HTML |
+
+### Typed Extraction
+
+Specify output type with optional transform:
+
+```sql
+EXTRACT (
+    -- Type coercion
+    price DECIMAL FROM jsonld.Product.offers.price,
+    quantity INTEGER FROM css '.qty::text',
+    in_stock BOOLEAN FROM jsonld.Product.offers.availability,
+
+    -- Type + transform
+    price DECIMAL FROM css '.price::text' | parse_price,
+    name VARCHAR FROM jsonld.Product.name | trim
+)
+```
+
+**Supported Types:**
+| Type | Description |
+|------|-------------|
+| `VARCHAR` | String (default) |
+| `DECIMAL` / `DOUBLE` / `FLOAT` | Numeric with decimals |
+| `INTEGER` / `BIGINT` / `INT` | Whole numbers |
+| `BOOLEAN` / `BOOL` | true/false |
+
+### Transforms
+
+Apply transformations to extracted values:
+
+```sql
+EXTRACT (
+    -- Whitespace handling
+    jsonld.Product.name | trim as name,
+
+    -- Price parsing: "€12.99" → "12.99"
+    price DECIMAL FROM css '.price::text' | parse_price,
+
+    -- Case conversion
+    jsonld.Product.sku | uppercase as sku,
+    og.title | lowercase as title_lower,
+
+    -- HTML stripping
+    jsonld.Product.description | strip_html as description
+)
+```
+
+**Available Transforms:**
+| Transform | Description | Example |
+|-----------|-------------|---------|
+| `trim` | Remove leading/trailing whitespace | `"  hello  "` → `"hello"` |
+| `parse_price` | Extract numeric from price string | `"€12,99"` → `"12.99"` |
+| `lowercase` | Convert to lowercase | `"Hello"` → `"hello"` |
+| `uppercase` | Convert to uppercase | `"Hello"` → `"HELLO"` |
+| `strip_html` | Remove HTML tags | `"<b>Hi</b>"` → `"Hi"` |
+
+### Type Coercion Details
+
+**DECIMAL/DOUBLE/FLOAT:**
+- Extracts digits and decimal point
+- Handles negative numbers
+- `"€12.99"` → `12.99`
+- `"-5.5"` → `-5.5`
+
+**INTEGER/BIGINT:**
+- Extracts digits only
+- Handles negative numbers
+- `"42 items"` → `42`
+- `"-10"` → `-10`
+
+**BOOLEAN:**
+- Recognizes: `true`, `false`, `yes`, `no`, `1`, `0`, `on`, `off`
+- Case-insensitive
+- Returns empty string for invalid values
+
+## WITH Options
+
+```sql
 WITH (
-    user_agent 'ShopCrawler/1.0 (+https://mysite.com/bot)',
-    default_crawl_delay 0.5,
-    max_crawl_delay 10.0,
+    -- Required
+    user_agent 'MyBot/1.0 (+https://example.com/bot)',
+
+    -- HTTP settings
     timeout_seconds 30,
+    max_retries 3,
+    compress true,
+
+    -- Crawl behavior
+    follow_links true,
+    max_crawl_depth 3,
+    max_crawl_pages 1000,
+    allow_subdomains false,
+
+    -- Rate limiting
+    default_crawl_delay 1.0,
+    min_crawl_delay 0.5,
+    max_crawl_delay 60.0,
     max_parallel_per_domain 4,
-    accept_content_types 'text/html',
-    compress true
-);
+
+    -- Content filtering
+    accept_content_types 'text/html,application/xhtml+xml',
+    reject_content_types 'application/pdf',
+    max_response_bytes 10485760,
+
+    -- robots.txt
+    respect_robots_txt true,
+
+    -- Extraction
+    extract_js true
+)
 ```
+
+### Option Reference
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `user_agent` | string | required | HTTP User-Agent header |
+| `timeout_seconds` | int | 30 | Request timeout |
+| `max_retries` | int | 3 | Retry failed requests |
+| `compress` | bool | true | Request gzip/deflate |
+| `follow_links` | bool | false | Discover linked pages |
+| `max_crawl_depth` | int | 10 | Maximum link depth |
+| `max_crawl_pages` | int | 10000 | Maximum pages to crawl |
+| `allow_subdomains` | bool | false | Follow subdomain links |
+| `default_crawl_delay` | float | 1.0 | Delay between requests (seconds) |
+| `min_crawl_delay` | float | 0.0 | Minimum delay floor |
+| `max_crawl_delay` | float | 60.0 | Maximum delay cap |
+| `max_parallel_per_domain` | int | 8 | Concurrent requests per domain |
+| `max_total_connections` | int | 32 | Global connection limit |
+| `accept_content_types` | string | '' | Whitelist content types |
+| `reject_content_types` | string | '' | Blacklist content types |
+| `max_response_bytes` | int | 10MB | Maximum response size |
+| `respect_robots_txt` | bool | true | Honor robots.txt |
+| `respect_nofollow` | bool | true | Skip rel=nofollow links |
+| `extract_js` | bool | false | Extract JS variables |
+| `sitemap_cache_hours` | float | 24.0 | Sitemap cache duration |
 
 ## Output Schema
 
-The target table is created automatically with this schema:
+The output table contains standard columns plus EXTRACT aliases:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| url | VARCHAR | Crawled URL |
-| surt_key | VARCHAR | SURT-normalized URL key (Common Crawl format) |
-| http_status | INTEGER | HTTP status code (200, 404, etc.) or -1 for disallowed |
-| body | VARCHAR | Response body |
-| content_type | VARCHAR | Content-Type header |
-| elapsed_ms | BIGINT | Request time in milliseconds |
-| crawled_at | TIMESTAMP | When the URL was crawled |
-| error | VARCHAR | Error message if failed |
-| error_type | VARCHAR | Classified error (network_timeout, http_rate_limited, etc.) |
-| etag | VARCHAR | ETag header for conditional requests |
-| last_modified | VARCHAR | Last-Modified header |
-| content_hash | VARCHAR | SHA-256 hash of response body |
+| `url` | VARCHAR | Fetched URL |
+| `surt_key` | VARCHAR | SURT-normalized URL (Common Crawl format) |
+| `status_code` | INTEGER | HTTP status code |
+| `body` | VARCHAR | Response body |
+| `content_type` | VARCHAR | Content-Type header |
+| `crawled_at` | TIMESTAMP | Fetch timestamp |
+| `elapsed_ms` | BIGINT | Request duration |
+| `error` | VARCHAR | Error message if failed |
+| `error_type` | VARCHAR | Classified error type |
+| `final_url` | VARCHAR | URL after redirects |
+| `redirect_count` | INTEGER | Number of redirects |
+| `etag` | VARCHAR | ETag header |
+| `last_modified` | VARCHAR | Last-Modified header |
+| `content_hash` | VARCHAR | SHA-256 of body |
+| `jsonld` | JSON | Full JSON-LD data |
+| `opengraph` | JSON | Full OpenGraph data |
+| `meta` | JSON | Full meta tags |
+| `js` | JSON | Full JS variables |
+| `<alias>` | VARCHAR | EXTRACT columns |
 
-## Parameters
+## Examples
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| user_agent | VARCHAR | **required** | User-Agent header (used for robots.txt matching) |
-| default_crawl_delay | DOUBLE | 1.0 | Default delay between requests (seconds) |
-| min_crawl_delay | DOUBLE | 0.0 | Minimum delay floor |
-| max_crawl_delay | DOUBLE | 60.0 | Maximum delay cap |
-| timeout_seconds | INTEGER | 30 | HTTP request timeout |
-| respect_robots_txt | BOOLEAN | true | Parse and respect robots.txt |
-| log_skipped | BOOLEAN | true | Include skipped URLs in output |
-| sitemap_cache_hours | DOUBLE | 24.0 | Hours to cache sitemap discovery |
-| update_stale | BOOLEAN | false | Re-crawl URLs with newer lastmod in sitemap |
-| max_retry_backoff_seconds | INTEGER | 600 | Max Fibonacci backoff for 429/5XX (10 min) |
-| max_parallel_per_domain | INTEGER | 8 | Max concurrent requests per domain |
-| max_total_connections | INTEGER | 32 | Global max concurrent connections |
-| max_response_bytes | BIGINT | 10485760 | Max response size (10MB) |
-| compress | BOOLEAN | true | Request gzip/deflate compression |
-| accept_content_types | VARCHAR | '' | Only accept these types (comma-separated, e.g., 'text/html,text/*') |
-| reject_content_types | VARCHAR | '' | Reject these types |
-| follow_links | BOOLEAN | false | Enable link-based crawling when sitemap not found |
-| allow_subdomains | BOOLEAN | false | Follow links to subdomains |
-| max_crawl_pages | INTEGER | 10000 | Max pages to discover via link following |
-| max_crawl_depth | INTEGER | 10 | Max link depth from start URL |
-| respect_nofollow | BOOLEAN | true | Skip rel="nofollow" links |
-| follow_canonical | BOOLEAN | true | Follow canonical URLs |
-
-## Auxiliary Tables
-
-The extension creates helper tables automatically:
-
-- `_crawl_sitemap_cache` - Cached sitemap URLs indexed by SURT key for fast domain lookups
-- `_crawl_sitemap_discovery_status` - Discovery method per domain (sitemap/link_crawl/not_found)
-
-### Query Sitemap Cache
+### E-commerce Product Scraping
 
 ```sql
--- View cached URLs for a domain using SURT prefix
-SELECT url, lastmod FROM _crawl_sitemap_cache
-WHERE surt_key LIKE 'com,example)%'
-ORDER BY lastmod DESC;
+CRAWL (SELECT 'https://shop.example.com/sitemap.xml')
+INTO products
+EXTRACT (
+    jsonld.Product.sku,
+    jsonld.Product.name | trim as name,
+    COALESCE(jsonld.Product.gtin13, microdata.Product.gtin) as gtin,
+    jsonld.Product.brand.name as brand,
+    price DECIMAL FROM jsonld.Product.offers.price,
+    jsonld.Product.offers.priceCurrency as currency,
+    jsonld.Product.offers.availability as stock_status,
+    jsonld.Product.image[0] as image
+)
+WHERE url LIKE '%/product/%'
+WITH (
+    user_agent 'PriceBot/1.0 (+https://mysite.com/bot)',
+    default_crawl_delay 0.5,
+    max_crawl_pages 5000
+);
+
+-- Analyze results
+SELECT
+    brand,
+    COUNT(*) as products,
+    printf('%.2f', AVG(price)) as avg_price
+FROM products
+WHERE price IS NOT NULL
+GROUP BY brand
+ORDER BY products DESC;
 ```
 
-## robots.txt Compliance
+### News Article Extraction
 
-The extension automatically:
-1. Fetches and caches robots.txt for each domain
-2. Parses Crawl-delay and Request-rate directives
-3. Respects Disallow/Allow rules
-4. Falls back to `User-agent: *` if no specific match
-5. Discovers sitemaps from Sitemap: directives
+```sql
+CRAWL (SELECT 'https://news.example.com/')
+INTO articles
+EXTRACT (
+    jsonld.NewsArticle.headline as title,
+    jsonld.NewsArticle.datePublished as published,
+    jsonld.NewsArticle.author.name as author,
+    og.description as summary,
+    css 'article.content p::text' | trim as first_paragraph
+)
+WHERE url LIKE '%/article/%'
+WITH (
+    user_agent 'NewsBot/1.0',
+    follow_links true,
+    max_crawl_depth 2,
+    max_crawl_pages 500
+);
+```
 
-## Error Classification
+### Finnish Grocery Store (Matsmart)
 
-Errors are classified into types for analytics:
+```sql
+CRAWL (SELECT 'https://www.matsmart.fi/')
+INTO matsmart_products
+EXTRACT (
+    COALESCE(jsonld.Product.sku, microdata.Product.sku) as sku,
+    COALESCE(jsonld.Product.gtin, jsonld.Product.gtin13) as gtin,
+    jsonld.Product.name as name,
+    jsonld.Product.brand.name as brand,
+    price DECIMAL FROM jsonld.Product.offers.price,
+    jsonld.Product.offers.priceCurrency as currency,
+    jsonld.Product.offers.availability as availability,
+    unit_price VARCHAR FROM css '.unit-price::text' | trim,
+    jsonld.Product.image[0] as image_url
+)
+WHERE url LIKE 'https://www.matsmart.fi/tuote/%'
+WITH (
+    user_agent 'Mozilla/5.0 (compatible; PriceBot/1.0)',
+    follow_links true,
+    max_crawl_depth 3,
+    crawl_delay_ms 500
+)
+LIMIT 100;
+```
+
+### Price Monitoring Over Time
+
+```sql
+-- Create monitoring table
+CREATE TABLE IF NOT EXISTS price_history (
+    sku VARCHAR,
+    price DECIMAL,
+    in_stock BOOLEAN,
+    checked_at TIMESTAMP
+);
+
+-- Crawl and append prices
+INSERT INTO price_history
+SELECT
+    sku,
+    price::DECIMAL,
+    availability LIKE '%InStock%' as in_stock,
+    crawled_at as checked_at
+FROM (
+    CRAWL (SELECT url FROM monitored_products)
+    INTO _tmp_prices
+    EXTRACT (
+        jsonld.Product.sku as sku,
+        jsonld.Product.offers.price as price,
+        jsonld.Product.offers.availability as availability
+    )
+    WITH (user_agent 'PriceMonitor/1.0', timeout_seconds 15)
+);
+
+-- Detect price changes
+SELECT
+    sku,
+    price,
+    LAG(price) OVER (PARTITION BY sku ORDER BY checked_at) as prev_price,
+    price - LAG(price) OVER (PARTITION BY sku ORDER BY checked_at) as change
+FROM price_history
+WHERE change != 0;
+```
+
+## Error Handling
+
+Errors are classified for easy filtering:
 
 | Error Type | Description |
 |------------|-------------|
-| network_timeout | Connection or read timeout |
-| network_dns_failure | DNS resolution failed |
-| network_connection_refused | Connection refused |
-| network_ssl_error | SSL/TLS error |
-| http_client_error | 4XX status codes |
-| http_server_error | 5XX status codes |
-| http_rate_limited | 429 Too Many Requests |
-| robots_disallowed | Blocked by robots.txt |
-| content_too_large | Response exceeds max_response_bytes |
-| content_type_rejected | Content-Type not accepted |
+| `network_timeout` | Connection or read timeout |
+| `network_dns_failure` | DNS resolution failed |
+| `network_connection_refused` | Connection refused |
+| `network_ssl_error` | SSL/TLS error |
+| `http_client_error` | 4XX status codes |
+| `http_server_error` | 5XX status codes |
+| `http_rate_limited` | 429 Too Many Requests |
+| `robots_disallowed` | Blocked by robots.txt |
+| `content_too_large` | Response exceeds limit |
+| `content_type_rejected` | Content-Type filtered |
 
-## Building from Source
-
-```bash
-git clone --recursive https://github.com/midwork-finds-jobs/duckdb-crawl.git
-cd duckdb-crawl
-make release GEN=ninja
+```sql
+-- Retry failed URLs
+CRAWL (
+    SELECT url FROM my_crawl
+    WHERE error_type = 'network_timeout'
+)
+INTO my_crawl_retry
+WITH (user_agent 'MyBot/1.0', timeout_seconds 60);
 ```
 
-## Testing
+## Performance
 
-```bash
-./build/release/duckdb -unsigned -c "
-LOAD 'build/release/extension/crawler/crawler.duckdb_extension';
-LOAD http_request;
+- **Parallel fetching**: Configurable thread pool
+- **Connection reuse**: libcurl connection pooling
+- **HTTP/2 multiplexing**: Multiple requests per connection
+- **Streaming parsing**: HTML parsed incrementally
+- **Batch inserts**: Efficient database writes
+- **Predicate pushdown**: URL filters skip unwanted pages
 
-CRAWL (SELECT 'httpbin.org')
-INTO test_results
-WITH (user_agent 'TestBot/1.0', follow_links true, max_crawl_pages 5);
+Typical throughput: **50-200 pages/second** depending on:
+- Network latency to target sites
+- Target server response times
+- Crawl delay settings
+- Page sizes
 
-SELECT url, http_status, length(body) as body_len FROM test_results;
-"
-```
+## Limitations
+
+- JavaScript rendering not supported (static HTML only)
+- Maximum response size: 10MB default
+- Cookies not persisted across requests
+- No proxy support (yet)
+- Single database connection
 
 ## Dependencies
 
-- Requires the `http_request` extension for HTTP requests
+Built with:
+- **libcurl** - HTTP client (HTTP/1-3, TLS)
+- **libxml2** - HTML parsing (C++)
+- **yyjson** - JSON parsing
+- **Rust** - HTML extraction (scraper, tree-sitter)
 
 ## License
 

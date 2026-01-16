@@ -232,7 +232,103 @@ static bool ParseWithOptions(const string &options_str, CrawlParseData &data) {
 	return true;
 }
 
-// Parse EXTRACT clause: EXTRACT (expr AS alias, expr2 AS alias2, ...)
+// Helper: Parse source string to ExtractSource enum
+static ExtractSource ParseSourceType(const string &source) {
+	string lower = StringUtil::Lower(source);
+	if (lower == "jsonld" || lower == "json-ld") return ExtractSource::JSONLD;
+	if (lower == "microdata") return ExtractSource::MICRODATA;
+	if (lower == "og" || lower == "opengraph") return ExtractSource::OPENGRAPH;
+	if (lower == "meta") return ExtractSource::META;
+	if (lower == "js" || lower == "javascript") return ExtractSource::JS;
+	if (lower == "css") return ExtractSource::CSS;
+	return ExtractSource::JSONLD; // Default
+}
+
+// Helper: Parse a path expression (dot notation or arrow notation)
+// Converts both to source and path components
+static void ParsePathExpression(const string &expr, ExtractSource &source, string &path) {
+	// Check for dot notation: jsonld.Product.name
+	size_t dot_pos = expr.find('.');
+	if (dot_pos != string::npos && expr.find("->") == string::npos) {
+		source = ParseSourceType(expr.substr(0, dot_pos));
+		path = expr.substr(dot_pos + 1);
+		return;
+	}
+
+	// Check for arrow notation: jsonld->'Product'->>'name'
+	size_t arrow_pos = expr.find("->");
+	if (arrow_pos != string::npos) {
+		source = ParseSourceType(expr.substr(0, arrow_pos));
+
+		// Convert arrow notation to dot notation
+		string remainder = expr.substr(arrow_pos);
+		string result_path;
+
+		size_t pos = 0;
+		while (pos < remainder.length()) {
+			size_t next_arrow = remainder.find("->", pos);
+			if (next_arrow == string::npos) break;
+
+			bool is_text = (next_arrow + 2 < remainder.length() &&
+			               remainder[next_arrow + 2] == '>');
+			size_t key_start = is_text ? next_arrow + 3 : next_arrow + 2;
+
+			while (key_start < remainder.length() && std::isspace(remainder[key_start])) {
+				key_start++;
+			}
+
+			string key;
+			if (key_start < remainder.length() && remainder[key_start] == '\'') {
+				size_t key_end = remainder.find('\'', key_start + 1);
+				if (key_end != string::npos) {
+					key = remainder.substr(key_start + 1, key_end - key_start - 1);
+					pos = key_end + 1;
+				} else break;
+			} else {
+				size_t key_end = remainder.find("->", key_start);
+				if (key_end == string::npos) {
+					key = remainder.substr(key_start);
+					pos = remainder.length();
+				} else {
+					key = remainder.substr(key_start, key_end - key_start);
+					pos = key_end;
+				}
+				while (!key.empty() && std::isspace(key.back())) key.pop_back();
+			}
+
+			if (!key.empty()) {
+				if (!result_path.empty()) result_path += ".";
+				result_path += key;
+			}
+		}
+		path = result_path;
+		return;
+	}
+
+	// Check for CSS: css 'selector' or css "selector"
+	string lower = StringUtil::Lower(expr);
+	if (StringUtil::StartsWith(lower, "css ")) {
+		source = ExtractSource::CSS;
+		path = Trim(expr.substr(4));
+		// Remove quotes
+		if (path.length() >= 2 &&
+		    ((path.front() == '\'' && path.back() == '\'') ||
+		     (path.front() == '"' && path.back() == '"'))) {
+			path = path.substr(1, path.length() - 2);
+		}
+		return;
+	}
+
+	// Default: assume jsonld with the expression as path
+	source = ExtractSource::JSONLD;
+	path = expr;
+}
+
+// Parse EXTRACT clause with enhanced syntax:
+// - Simple: jsonld.Product.name as name
+// - COALESCE: COALESCE(jsonld.Product.gtin13, microdata.Product.gtin) as gtin
+// - Typed: price DECIMAL FROM css '.price::text' | parse_price
+// - Legacy: jsonld->'Product'->>'name' as name
 static bool ParseExtractClause(const string &extract_str, CrawlParseData &data) {
 	// Remove outer parentheses
 	string content = Trim(extract_str);
@@ -268,55 +364,177 @@ static bool ParseExtractClause(const string &extract_str, CrawlParseData &data) 
 		}
 		pos++;
 	}
-	// Add last spec
 	if (start < content.length()) {
 		specs.push_back(Trim(content.substr(start)));
 	}
 
-	// Parse each spec: "expr AS alias" or "expr as alias"
 	for (const auto &spec_str : specs) {
-		if (spec_str.empty()) {
+		if (spec_str.empty()) continue;
+
+		ExtractSpec spec;
+		string spec_lower = StringUtil::Lower(spec_str);
+
+		// Check for COALESCE syntax: COALESCE(path1, path2, ...) as alias
+		if (StringUtil::StartsWith(spec_lower, "coalesce(") ||
+		    StringUtil::StartsWith(spec_lower, "coalesce (")) {
+			size_t paren_start = spec_str.find('(');
+			size_t paren_end = FindClosingParen(spec_str, paren_start);
+			if (paren_end == string::npos) continue;
+
+			string args = spec_str.substr(paren_start + 1, paren_end - paren_start - 1);
+			string after_paren = Trim(spec_str.substr(paren_end + 1));
+
+			// Parse alias after COALESCE(...)
+			string after_lower = StringUtil::Lower(after_paren);
+			size_t as_pos = after_lower.find(" as ");
+			if (as_pos == string::npos && StringUtil::StartsWith(after_lower, "as ")) {
+				as_pos = 0;
+			}
+			if (as_pos != string::npos) {
+				size_t alias_start = (as_pos == 0) ? 3 : as_pos + 4;
+				spec.alias = Trim(after_paren.substr(alias_start));
+			}
+
+			// Parse coalesce arguments
+			vector<string> coalesce_args;
+			size_t arg_start = 0;
+			int depth = 0;
+			for (size_t i = 0; i <= args.length(); i++) {
+				if (i == args.length() || (args[i] == ',' && depth == 0)) {
+					coalesce_args.push_back(Trim(args.substr(arg_start, i - arg_start)));
+					arg_start = i + 1;
+				} else if (args[i] == '(') depth++;
+				else if (args[i] == ')') depth--;
+			}
+
+			spec.is_coalesce = true;
+			for (const auto &arg : coalesce_args) {
+				ExtractSource src;
+				string pth;
+				ParsePathExpression(arg, src, pth);
+				// Store as source.path format
+				string source_name;
+				switch (src) {
+					case ExtractSource::JSONLD: source_name = "jsonld"; break;
+					case ExtractSource::MICRODATA: source_name = "microdata"; break;
+					case ExtractSource::OPENGRAPH: source_name = "og"; break;
+					case ExtractSource::META: source_name = "meta"; break;
+					case ExtractSource::JS: source_name = "js"; break;
+					case ExtractSource::CSS: source_name = "css"; break;
+				}
+				spec.coalesce_paths.push_back(source_name + "." + pth);
+			}
+			spec.expression = spec_str;
+			data.extract_specs.push_back(spec);
 			continue;
 		}
 
-		ExtractSpec spec;
+		// Check for typed extraction: alias TYPE FROM source_expr [| transform]
+		// e.g., price DECIMAL FROM css '.price::text' | parse_price
+		size_t from_pos = spec_lower.find(" from ");
+		if (from_pos != string::npos) {
+			// Parse: alias TYPE FROM source_expr [| transform]
+			string before_from = Trim(spec_str.substr(0, from_pos));
+			string after_from = Trim(spec_str.substr(from_pos + 6));
 
-		// Find " AS " or " as " (case-insensitive, with spaces)
-		string spec_lower = StringUtil::Lower(spec_str);
-		size_t as_pos = spec_lower.rfind(" as ");
-		if (as_pos == string::npos) {
-			// No alias - use last part of expression as alias
-			// e.g., jsonld->'Product'->>'name' -> alias is 'name'
-			size_t arrow_pos = spec_str.rfind("->>");
-			if (arrow_pos == string::npos) {
-				arrow_pos = spec_str.rfind("->");
-			}
-			if (arrow_pos != string::npos) {
-				string last_part = spec_str.substr(arrow_pos + (spec_str[arrow_pos + 2] == '>' ? 3 : 2));
-				last_part = Trim(last_part);
-				// Remove quotes from 'name'
-				if (last_part.length() >= 2 && last_part.front() == '\'' && last_part.back() == '\'') {
-					last_part = last_part.substr(1, last_part.length() - 2);
+			// Parse alias and optional type from before_from
+			vector<string> parts;
+			size_t space_pos = 0;
+			size_t part_start = 0;
+			while ((space_pos = before_from.find(' ', part_start)) != string::npos) {
+				if (space_pos > part_start) {
+					parts.push_back(before_from.substr(part_start, space_pos - part_start));
 				}
-				spec.alias = last_part;
-			} else {
-				// No arrow, use whole expression as alias
-				spec.alias = spec_str;
+				part_start = space_pos + 1;
 			}
+			if (part_start < before_from.length()) {
+				parts.push_back(before_from.substr(part_start));
+			}
+
+			if (parts.size() >= 1) {
+				spec.alias = parts[0];
+			}
+			if (parts.size() >= 2) {
+				spec.target_type = StringUtil::Upper(parts[1]);
+			}
+
+			// Parse transform (after |)
+			size_t pipe_pos = after_from.find('|');
+			string source_expr;
+			if (pipe_pos != string::npos) {
+				source_expr = Trim(after_from.substr(0, pipe_pos));
+				spec.transform = Trim(after_from.substr(pipe_pos + 1));
+			} else {
+				source_expr = after_from;
+			}
+
+			ParsePathExpression(source_expr, spec.source, spec.path);
 			spec.expression = spec_str;
-		} else {
-			spec.expression = Trim(spec_str.substr(0, as_pos));
-			spec.alias = Trim(spec_str.substr(as_pos + 4));
+			data.extract_specs.push_back(spec);
+			continue;
 		}
 
-		// Determine if expression ends with ->> (text) or -> (json)
-		spec.is_text = (spec.expression.find("->>") != string::npos &&
-		                spec.expression.rfind("->>") > spec.expression.rfind("->'" ));
+		// Standard syntax: expr [as alias]
+		size_t as_pos = spec_lower.rfind(" as ");
+		if (as_pos != string::npos) {
+			spec.expression = Trim(spec_str.substr(0, as_pos));
+			spec.alias = Trim(spec_str.substr(as_pos + 4));
+		} else {
+			spec.expression = spec_str;
+			// Auto-generate alias from last path segment
+			ParsePathExpression(spec_str, spec.source, spec.path);
+			size_t last_dot = spec.path.rfind('.');
+			if (last_dot != string::npos) {
+				spec.alias = spec.path.substr(last_dot + 1);
+			} else if (!spec.path.empty()) {
+				spec.alias = spec.path;
+			} else {
+				spec.alias = spec_str;
+			}
+		}
+
+		// Parse path if not already done
+		if (spec.path.empty()) {
+			ParsePathExpression(spec.expression, spec.source, spec.path);
+		}
+
+		// Determine text output mode
+		spec.is_text = (spec.expression.find("->>") != string::npos);
 
 		data.extract_specs.push_back(spec);
 	}
 
 	return !data.extract_specs.empty();
+}
+
+// Helper: Escape string for JSON
+static string EscapeJsonString(const string &s) {
+	string result;
+	result.reserve(s.length() + 10);
+	for (char c : s) {
+		switch (c) {
+			case '"': result += "\\\""; break;
+			case '\\': result += "\\\\"; break;
+			case '\n': result += "\\n"; break;
+			case '\r': result += "\\r"; break;
+			case '\t': result += "\\t"; break;
+			default: result += c;
+		}
+	}
+	return result;
+}
+
+// Helper: Convert ExtractSource enum to string
+static string SourceToString(ExtractSource source) {
+	switch (source) {
+		case ExtractSource::JSONLD: return "jsonld";
+		case ExtractSource::MICRODATA: return "microdata";
+		case ExtractSource::OPENGRAPH: return "og";
+		case ExtractSource::META: return "meta";
+		case ExtractSource::JS: return "js";
+		case ExtractSource::CSS: return "css";
+		default: return "jsonld";
+	}
 }
 
 // Serialize extract_specs to JSON string for parameter passing
@@ -330,23 +548,29 @@ static string SerializeExtractSpecs(const vector<ExtractSpec> &specs) {
 		if (i > 0) {
 			json += ",";
 		}
-		// Escape quotes in expression and alias
-		string expr = specs[i].expression;
-		string alias = specs[i].alias;
-		// Simple escape: replace " with \"
-		size_t pos = 0;
-		while ((pos = expr.find('"', pos)) != string::npos) {
-			expr.replace(pos, 1, "\\\"");
-			pos += 2;
-		}
-		pos = 0;
-		while ((pos = alias.find('"', pos)) != string::npos) {
-			alias.replace(pos, 1, "\\\"");
-			pos += 2;
+
+		const auto &spec = specs[i];
+
+		json += "{";
+		json += "\"expr\":\"" + EscapeJsonString(spec.expression) + "\",";
+		json += "\"alias\":\"" + EscapeJsonString(spec.alias) + "\",";
+		json += "\"is_text\":" + string(spec.is_text ? "true" : "false") + ",";
+		json += "\"source\":\"" + SourceToString(spec.source) + "\",";
+		json += "\"path\":\"" + EscapeJsonString(spec.path) + "\",";
+		json += "\"target_type\":\"" + EscapeJsonString(spec.target_type) + "\",";
+		json += "\"transform\":\"" + EscapeJsonString(spec.transform) + "\",";
+		json += "\"is_coalesce\":" + string(spec.is_coalesce ? "true" : "false");
+
+		if (spec.is_coalesce && !spec.coalesce_paths.empty()) {
+			json += ",\"coalesce_paths\":[";
+			for (size_t j = 0; j < spec.coalesce_paths.size(); j++) {
+				if (j > 0) json += ",";
+				json += "\"" + EscapeJsonString(spec.coalesce_paths[j]) + "\"";
+			}
+			json += "]";
 		}
 
-		json += "{\"expr\":\"" + expr + "\",\"alias\":\"" + alias + "\",\"is_text\":" +
-		        (specs[i].is_text ? "true" : "false") + "}";
+		json += "}";
 	}
 	json += "]";
 	return json;
@@ -535,7 +759,7 @@ ParserExtensionParseResult CrawlParserExtension::ParseCrawl(ParserExtensionInfo 
 		}
 	}
 
-	// Parse LIMIT clause if present - sets max_crawl_pages
+	// Parse LIMIT clause if present - sets row_limit for early stopping
 	if (limit_pos != string::npos) {
 		string after_limit = Trim(after_into.substr(limit_pos + 5)); // skip "limit"
 		// Remove trailing semicolon
@@ -545,9 +769,9 @@ ParserExtensionParseResult CrawlParserExtension::ParseCrawl(ParserExtensionInfo 
 		}
 		// Parse the number
 		try {
-			int limit_value = std::stoi(after_limit);
+			int64_t limit_value = std::stoll(after_limit);
 			if (limit_value > 0) {
-				data->max_crawl_pages = limit_value;
+				data->row_limit = limit_value;
 			}
 		} catch (...) {
 			return ParserExtensionParseResult("CRAWL syntax error: LIMIT must be followed by a positive integer");
@@ -620,6 +844,7 @@ ParserExtensionPlanResult CrawlParserExtension::PlanCrawl(ParserExtensionInfo *i
 	result.parameters.push_back(Value(data.num_threads));
 	result.parameters.push_back(Value(data.extract_js));
 	result.parameters.push_back(Value(SerializeExtractSpecs(data.extract_specs)));
+	result.parameters.push_back(Value(data.row_limit));
 
 	result.requires_valid_transaction = true;
 	result.return_type = StatementReturnType::CHANGED_ROWS;

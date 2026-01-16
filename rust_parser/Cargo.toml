@@ -1,0 +1,30 @@
+[package]
+name = "rust_parser"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+name = "rust_parser"
+
+[dependencies]
+# HTML parsing
+scraper = "0.24"
+# JSON handling for FFI
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# JSON-LD extraction (reusing from our html_parser patterns)
+html5ever = "0.29"
+# Tree-sitter for JS variable extraction
+tree-sitter = "0.25"
+tree-sitter-javascript = "0.25"
+# Regex for fallback parsing
+regex = "1.11"
+# Safe C string handling
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true

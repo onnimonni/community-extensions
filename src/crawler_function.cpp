@@ -8,6 +8,7 @@
 #include "structured_data.hpp"
 #include "json_path_evaluator.hpp"
 #include "crawl_parser.hpp"
+#include "rust_ffi.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
@@ -181,6 +182,8 @@ struct CrawlIntoBindData : public TableFunctionData {
 	int num_threads = 0;  // 0 = auto (hardware_concurrency)
 	// Structured data extraction
 	bool extract_js = true;  // Extract JS variables (can be disabled for performance)
+	// Row limit (LIMIT clause) - stops crawl after N matching rows inserted
+	int64_t row_limit = 0;   // 0 = no limit
 	// EXTRACT clause - custom column extraction
 	std::string extract_specs_json;  // JSON serialized extract specs
 	std::vector<ExtractSpec> extract_specs;  // Parsed extract specs
@@ -210,8 +213,8 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 	// Order: statement_type, source_query, target_table, user_agent, delays..., url_filter, sitemap_cache_hours,
 	//        update_stale, max_retry_backoff_seconds, max_parallel_per_domain, max_total_connections, max_response_bytes,
 	//        compress, accept_content_types, reject_content_types, follow_links, allow_subdomains, max_crawl_pages,
-	//        max_crawl_depth, respect_nofollow, follow_canonical, num_threads, extract_js
-	if (input.inputs.size() >= 29) {
+	//        max_crawl_depth, respect_nofollow, follow_canonical, num_threads, extract_js, extract_specs, row_limit
+	if (input.inputs.size() >= 30) {
 		bind_data->statement_type = input.inputs[0].GetValue<int32_t>();
 		bind_data->source_query = StringValue::Get(input.inputs[1]);
 		bind_data->target_table = StringValue::Get(input.inputs[2]);
@@ -241,6 +244,7 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 		bind_data->num_threads = input.inputs[26].GetValue<int>();
 		bind_data->extract_js = input.inputs[27].GetValue<bool>();
 		bind_data->extract_specs_json = StringValue::Get(input.inputs[28]);
+		bind_data->row_limit = input.inputs[29].GetValue<int64_t>();
 
 		// Parse extract_specs_json into extract_specs and extract_paths
 		if (!bind_data->extract_specs_json.empty() && bind_data->extract_specs_json != "[]") {
@@ -286,7 +290,7 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 			}
 		}
 	} else {
-		throw BinderException("crawl_into_internal: insufficient parameters (expected 29, got " +
+		throw BinderException("crawl_into_internal: insufficient parameters (expected 30, got " +
 		                      std::to_string(input.inputs.size()) + ")");
 	}
 
@@ -1338,6 +1342,11 @@ static void CrawlWorker(
 	local_batch.reserve(LOCAL_BATCH_SIZE);
 
 	while (!should_stop.load()) {
+		// Check row_limit in worker for faster response
+		if (bind_data.row_limit > 0 && rows_changed.load() >= bind_data.row_limit) {
+			break;
+		}
+
 		UrlQueueEntry entry("", 0, false);
 		if (!url_queue.WaitAndPop(entry, std::chrono::milliseconds(100))) {
 			if (url_queue.Empty() && in_flight.load() == 0) {
@@ -1559,8 +1568,29 @@ static void CrawlWorker(
 
 		// Extract structured data from HTML content
 		std::string jsonld_json, opengraph_json, meta_json, hydration_json, js_json;
+		std::string microdata_json;  // Only from Rust parser
 		if (response.success && !response.body.empty() &&
 		    response.content_type.find("text/html") != std::string::npos) {
+#if defined(RUST_PARSER_AVAILABLE) && RUST_PARSER_AVAILABLE
+			// Use Rust extractors when available (includes microdata support)
+			jsonld_json = ExtractJsonLdWithRust(response.body);
+			microdata_json = ExtractMicrodataWithRust(response.body);
+			opengraph_json = ExtractOpenGraphWithRust(response.body);
+			if (bind_data.extract_js) {
+				js_json = ExtractJsWithRust(response.body);
+			}
+			// meta and hydration still use C++ extractors
+			ExtractionConfig config;
+			config.extract_jsonld = false;  // Already extracted with Rust
+			config.extract_opengraph = false;
+			config.extract_js = false;
+			config.extract_meta = true;
+			config.extract_hydration = true;
+			auto structured = ExtractStructuredData(response.body, config);
+			meta_json = structured.meta;
+			hydration_json = structured.hydration;
+#else
+			// Use C++ extractors (no microdata support)
 			ExtractionConfig config;
 			config.extract_js = bind_data.extract_js;
 			auto structured = ExtractStructuredData(response.body, config);
@@ -1569,29 +1599,191 @@ static void CrawlWorker(
 			meta_json = structured.meta;
 			hydration_json = structured.hydration;
 			js_json = structured.js;
+#endif
 		}
 
 		// Evaluate EXTRACT expressions if present
 		std::vector<std::string> extracted_values;
-		if (!bind_data.extract_paths.empty()) {
-			for (size_t i = 0; i < bind_data.extract_paths.size(); i++) {
-				const auto &path = bind_data.extract_paths[i];
-				std::string source_json;
+		if (!bind_data.extract_specs.empty()) {
+			for (size_t i = 0; i < bind_data.extract_specs.size(); i++) {
+				const auto &spec = bind_data.extract_specs[i];
+				std::string value;
 
-				// Get source JSON based on base column
-				if (path.base_column == "jsonld") {
-					source_json = jsonld_json;
-				} else if (path.base_column == "opengraph") {
-					source_json = opengraph_json;
-				} else if (path.base_column == "meta") {
-					source_json = meta_json;
-				} else if (path.base_column == "hydration") {
-					source_json = hydration_json;
-				} else if (path.base_column == "js") {
-					source_json = js_json;
+				if (spec.is_coalesce) {
+					// COALESCE: try each path until we find a non-empty value
+					for (const auto &coalesce_path : spec.coalesce_paths) {
+						// Parse source.path format
+						size_t dot_pos = coalesce_path.find('.');
+						std::string source_name = (dot_pos != std::string::npos) ?
+						    coalesce_path.substr(0, dot_pos) : coalesce_path;
+						std::string path_str = (dot_pos != std::string::npos) ?
+						    coalesce_path.substr(dot_pos + 1) : "";
+
+						std::string source_json;
+						if (source_name == "jsonld") source_json = jsonld_json;
+						else if (source_name == "microdata") source_json = microdata_json;
+						else if (source_name == "og" || source_name == "opengraph") source_json = opengraph_json;
+						else if (source_name == "meta") source_json = meta_json;
+						else if (source_name == "hydration") source_json = hydration_json;
+						else if (source_name == "js") source_json = js_json;
+#if defined(RUST_PARSER_AVAILABLE) && RUST_PARSER_AVAILABLE
+						else if (source_name == "css") {
+							// CSS selector - use Rust
+							auto css_result = ExtractCssWithRust(response.body, path_str);
+							// Parse first element from JSON array
+							if (css_result.length() > 2 && css_result[0] == '[') {
+								size_t str_start = css_result.find('"');
+								if (str_start != std::string::npos) {
+									size_t str_end = css_result.find('"', str_start + 1);
+									if (str_end != std::string::npos) {
+										value = css_result.substr(str_start + 1, str_end - str_start - 1);
+									}
+								}
+							}
+							if (!value.empty()) break;
+							continue;
+						}
+#endif
+
+						if (!source_json.empty() && source_json != "{}") {
+							JsonPath jp;
+							jp.base_column = source_name;
+							// Parse dot notation path into segments
+							size_t seg_start = 0;
+							while (seg_start < path_str.length()) {
+								size_t seg_end = path_str.find('.', seg_start);
+								if (seg_end == std::string::npos) seg_end = path_str.length();
+								JsonPathSegment seg;
+								seg.key = path_str.substr(seg_start, seg_end - seg_start);
+								seg.return_text = true;
+								jp.segments.push_back(seg);
+								seg_start = seg_end + 1;
+							}
+							value = EvaluateJsonPath(source_json, jp);
+							if (!value.empty()) break;
+						}
+					}
+				} else if (spec.source == ExtractSource::CSS) {
+#if defined(RUST_PARSER_AVAILABLE) && RUST_PARSER_AVAILABLE
+					// CSS selector extraction via Rust
+					auto css_result = ExtractCssWithRust(response.body, spec.path);
+					if (css_result.length() > 2 && css_result[0] == '[') {
+						size_t str_start = css_result.find('"');
+						if (str_start != std::string::npos) {
+							size_t str_end = css_result.find('"', str_start + 1);
+							if (str_end != std::string::npos) {
+								value = css_result.substr(str_start + 1, str_end - str_start - 1);
+							}
+						}
+					}
+#endif
+				} else {
+					// Standard path extraction
+					std::string source_json;
+					switch (spec.source) {
+						case ExtractSource::JSONLD: source_json = jsonld_json; break;
+						case ExtractSource::MICRODATA: source_json = microdata_json; break;
+						case ExtractSource::OPENGRAPH: source_json = opengraph_json; break;
+						case ExtractSource::META: source_json = meta_json; break;
+						case ExtractSource::JS: source_json = js_json; break;
+						default: break;
+					}
+
+					if (!source_json.empty() && source_json != "{}") {
+						// Use existing JsonPath evaluation
+						if (i < bind_data.extract_paths.size()) {
+							value = EvaluateJsonPath(source_json, bind_data.extract_paths[i]);
+						}
+					}
 				}
 
-				std::string value = EvaluateJsonPath(source_json, path);
+				// Apply transform if specified
+				if (!value.empty() && !spec.transform.empty()) {
+					if (spec.transform == "trim") {
+						size_t start = value.find_first_not_of(" \t\n\r");
+						size_t end = value.find_last_not_of(" \t\n\r");
+						if (start != std::string::npos && end != std::string::npos) {
+							value = value.substr(start, end - start + 1);
+						}
+					} else if (spec.transform == "parse_price") {
+						// Extract numeric value from price string like "€12.99" or "12,99 €"
+						std::string numeric;
+						bool has_decimal = false;
+						for (char c : value) {
+							if (c >= '0' && c <= '9') {
+								numeric += c;
+							} else if ((c == '.' || c == ',') && !has_decimal) {
+								numeric += '.';
+								has_decimal = true;
+							}
+						}
+						value = numeric;
+					} else if (spec.transform == "lowercase") {
+						std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+					} else if (spec.transform == "uppercase") {
+						std::transform(value.begin(), value.end(), value.begin(), ::toupper);
+					} else if (spec.transform == "strip_html") {
+						// Remove HTML tags
+						std::string clean;
+						bool in_tag = false;
+						for (char c : value) {
+							if (c == '<') in_tag = true;
+							else if (c == '>') in_tag = false;
+							else if (!in_tag) clean += c;
+						}
+						value = clean;
+					}
+				}
+
+				// Apply type coercion if specified
+				if (!value.empty() && !spec.target_type.empty()) {
+					if (spec.target_type == "DECIMAL" || spec.target_type == "DOUBLE" ||
+					    spec.target_type == "FLOAT") {
+						// Validate numeric - keep only digits and decimal point
+						std::string numeric;
+						bool has_decimal = false;
+						bool has_minus = false;
+						for (char c : value) {
+							if (c == '-' && !has_minus && numeric.empty()) {
+								numeric += c;
+								has_minus = true;
+							} else if (c >= '0' && c <= '9') {
+								numeric += c;
+							} else if (c == '.' && !has_decimal) {
+								numeric += c;
+								has_decimal = true;
+							}
+						}
+						value = numeric.empty() ? "" : numeric;
+					} else if (spec.target_type == "INTEGER" || spec.target_type == "BIGINT" ||
+					           spec.target_type == "INT") {
+						// Extract integer value
+						std::string numeric;
+						bool has_minus = false;
+						for (char c : value) {
+							if (c == '-' && !has_minus && numeric.empty()) {
+								numeric += c;
+								has_minus = true;
+							} else if (c >= '0' && c <= '9') {
+								numeric += c;
+							}
+						}
+						value = numeric.empty() ? "" : numeric;
+					} else if (spec.target_type == "BOOLEAN" || spec.target_type == "BOOL") {
+						// Parse boolean
+						std::string lower = value;
+						std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+						if (lower == "true" || lower == "1" || lower == "yes" || lower == "on") {
+							value = "true";
+						} else if (lower == "false" || lower == "0" || lower == "no" || lower == "off") {
+							value = "false";
+						} else {
+							value = "";  // Invalid boolean
+						}
+					}
+					// VARCHAR/TEXT - no coercion needed
+				}
+
 				extracted_values.push_back(value);
 			}
 		}
@@ -1886,6 +2078,13 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			break;
 		}
 
+		// Check if row_limit reached (LIMIT pushdown)
+		if (bind_data.row_limit > 0 && rows_changed.load() >= bind_data.row_limit) {
+			should_stop.store(true);
+			url_queue.Shutdown();
+			break;
+		}
+
 		// Check if all work is done: queue empty AND no in-flight requests
 		if (url_queue.Empty() && in_flight.load() == 0) {
 			// Double check after brief wait to avoid race
@@ -1975,7 +2174,9 @@ void RegisterCrawlIntoFunction(ExtensionLoader &loader) {
 	                                LogicalType::BOOLEAN,  // respect_nofollow
 	                                LogicalType::BOOLEAN,  // follow_canonical
 	                                LogicalType::INTEGER,  // num_threads
-	                                LogicalType::BOOLEAN}, // extract_js
+	                                LogicalType::BOOLEAN,  // extract_js
+	                                LogicalType::VARCHAR,  // extract_specs_json
+	                                LogicalType::BIGINT},  // row_limit
 	                               CrawlIntoFunction, CrawlIntoBind, CrawlIntoInitGlobal);
 
 	// Set progress callback for progress bar integration
