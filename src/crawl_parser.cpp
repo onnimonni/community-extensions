@@ -40,6 +40,7 @@ unique_ptr<ParserExtensionParseData> CrawlParseData::Copy() const {
 	copy->respect_nofollow = respect_nofollow;
 	copy->follow_canonical = follow_canonical;
 	copy->num_threads = num_threads;
+	copy->extract_js = extract_js;
 	return copy;
 }
 
@@ -201,6 +202,8 @@ static bool ParseWithOptions(const string &options_str, CrawlParseData &data) {
 			data.follow_canonical = (StringUtil::Lower(value) == "true" || value == "1");
 		} else if (key == "threads" || key == "num_threads") {
 			data.num_threads = std::stoi(value);
+		} else if (key == "extract_js") {
+			data.extract_js = (StringUtil::Lower(value) == "true" || value == "1");
 		}
 	}
 
@@ -386,6 +389,7 @@ ParserExtensionPlanResult CrawlParserExtension::PlanCrawl(ParserExtensionInfo *i
 	result.parameters.push_back(Value(data.respect_nofollow));
 	result.parameters.push_back(Value(data.follow_canonical));
 	result.parameters.push_back(Value(data.num_threads));
+	result.parameters.push_back(Value(data.extract_js));
 
 	result.requires_valid_transaction = true;
 	result.return_type = StatementReturnType::CHANGED_ROWS;

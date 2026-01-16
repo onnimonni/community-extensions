@@ -5,6 +5,7 @@ set(TARGET_NAME crawler)
 # Dependencies via vcpkg
 find_package(ZLIB REQUIRED)
 find_package(CURL REQUIRED)
+find_package(LibXml2 REQUIRED)
 
 # Check for HTTP/2 support via curl
 # vcpkg's curl with http2 feature links nghttp2 statically
@@ -45,13 +46,18 @@ set(EXTENSION_SOURCES
     src/crawl_parser.cpp
     src/sitemap_parser.cpp
     src/link_parser.cpp
+    src/jsonld_extractor.cpp
+    src/opengraph_extractor.cpp
+    src/hydration_extractor.cpp
+    src/js_variables_extractor.cpp
+    src/structured_data.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-target_link_libraries(${EXTENSION_NAME} ZLIB::ZLIB CURL::libcurl)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ZLIB::ZLIB CURL::libcurl)
+target_link_libraries(${EXTENSION_NAME} ZLIB::ZLIB CURL::libcurl LibXml2::LibXml2)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ZLIB::ZLIB CURL::libcurl LibXml2::LibXml2)
 
 # Set compile definitions based on detected features
 if(CRAWLER_HTTP2_SUPPORT)

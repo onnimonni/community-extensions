@@ -1,0 +1,350 @@
+#include "js_variables_extractor.hpp"
+#include <libxml/HTMLparser.h>
+#include <libxml/tree.h>
+#include <regex>
+#include "yyjson.hpp"
+
+namespace duckdb {
+
+using namespace duckdb_yyjson;
+
+// RAII wrapper for xmlDoc
+class JsVarsDocGuard {
+public:
+	explicit JsVarsDocGuard(xmlDocPtr doc) : doc_(doc) {}
+	~JsVarsDocGuard() {
+		if (doc_) {
+			xmlFreeDoc(doc_);
+		}
+	}
+	xmlDocPtr get() const { return doc_; }
+	operator bool() const { return doc_ != nullptr; }
+private:
+	xmlDocPtr doc_;
+};
+
+// Validate and parse JSON, returns doc or nullptr
+static yyjson_doc* TryParseJson(const std::string &json) {
+	if (json.empty()) {
+		return nullptr;
+	}
+	return yyjson_read(json.c_str(), json.size(),
+	                   YYJSON_READ_ALLOW_TRAILING_COMMAS | YYJSON_READ_ALLOW_COMMENTS);
+}
+
+// Extract JSON object/array starting from position
+// Returns empty string if not valid JSON
+static std::string ExtractJsonValue(const std::string &content, size_t start_pos) {
+	if (start_pos >= content.size()) {
+		return "";
+	}
+
+	// Skip whitespace
+	while (start_pos < content.size() &&
+	       (content[start_pos] == ' ' || content[start_pos] == '\t' ||
+	        content[start_pos] == '\n' || content[start_pos] == '\r')) {
+		start_pos++;
+	}
+
+	if (start_pos >= content.size()) {
+		return "";
+	}
+
+	char first_char = content[start_pos];
+
+	// Only extract objects and arrays (not primitives)
+	if (first_char != '{' && first_char != '[') {
+		return "";
+	}
+
+	char open_char = first_char;
+	char close_char = (open_char == '{') ? '}' : ']';
+
+	int depth = 1;
+	bool in_string = false;
+	bool escape_next = false;
+
+	for (size_t i = start_pos + 1; i < content.size() && depth > 0; i++) {
+		char c = content[i];
+
+		if (escape_next) {
+			escape_next = false;
+			continue;
+		}
+
+		if (c == '\\' && in_string) {
+			escape_next = true;
+			continue;
+		}
+
+		if (c == '"' && !escape_next) {
+			in_string = !in_string;
+			continue;
+		}
+
+		if (!in_string) {
+			if (c == '{' || c == '[') {
+				depth++;
+			} else if (c == '}' || c == ']') {
+				depth--;
+				if (depth == 0) {
+					std::string json = content.substr(start_pos, i - start_pos + 1);
+					// Validate with yyjson
+					yyjson_doc *doc = TryParseJson(json);
+					if (doc) {
+						yyjson_doc_free(doc);
+						return json;
+					}
+					return "";
+				}
+			}
+		}
+	}
+
+	return "";
+}
+
+// Check if character is valid for JS identifier
+static bool IsIdentifierChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+}
+
+// Extract variable name from assignment pattern
+// Returns variable name and position after the = sign
+static std::pair<std::string, size_t> ExtractAssignment(const std::string &script, size_t pos) {
+	// Skip leading whitespace
+	while (pos < script.size() && std::isspace(static_cast<unsigned char>(script[pos]))) {
+		pos++;
+	}
+
+	if (pos >= script.size()) {
+		return {"", 0};
+	}
+
+	std::string keyword;
+	size_t keyword_start = pos;
+
+	// Check for var/let/const/window
+	if (script.substr(pos, 4) == "var " || script.substr(pos, 4) == "let ") {
+		keyword = script.substr(pos, 3);
+		pos += 4;
+	} else if (script.substr(pos, 6) == "const ") {
+		keyword = "const";
+		pos += 6;
+	} else if (script.substr(pos, 7) == "window.") {
+		keyword = "window";
+		pos += 7;
+	} else {
+		return {"", 0};
+	}
+
+	// Skip whitespace after keyword
+	while (pos < script.size() && std::isspace(static_cast<unsigned char>(script[pos]))) {
+		pos++;
+	}
+
+	// Extract variable name
+	size_t name_start = pos;
+	while (pos < script.size() && IsIdentifierChar(script[pos])) {
+		pos++;
+	}
+
+	if (pos == name_start) {
+		return {"", 0};
+	}
+
+	std::string var_name = script.substr(name_start, pos - name_start);
+
+	// Skip whitespace before =
+	while (pos < script.size() && std::isspace(static_cast<unsigned char>(script[pos]))) {
+		pos++;
+	}
+
+	// Must have = sign
+	if (pos >= script.size() || script[pos] != '=') {
+		return {"", 0};
+	}
+
+	pos++; // Skip =
+
+	// Skip whitespace after =
+	while (pos < script.size() && std::isspace(static_cast<unsigned char>(script[pos]))) {
+		pos++;
+	}
+
+	return {var_name, pos};
+}
+
+// Find all variable assignments in script content
+static void ExtractVariablesFromScript(const std::string &script, JsVariablesResult &result) {
+	size_t pos = 0;
+
+	while (pos < script.size()) {
+		// Find start of potential assignment (var, let, const, window.)
+		size_t next_var = script.find("var ", pos);
+		size_t next_let = script.find("let ", pos);
+		size_t next_const = script.find("const ", pos);
+		size_t next_window = script.find("window.", pos);
+
+		// Find earliest match
+		size_t earliest = std::string::npos;
+		if (next_var != std::string::npos && next_var < earliest) earliest = next_var;
+		if (next_let != std::string::npos && next_let < earliest) earliest = next_let;
+		if (next_const != std::string::npos && next_const < earliest) earliest = next_const;
+		if (next_window != std::string::npos && next_window < earliest) earliest = next_window;
+
+		if (earliest == std::string::npos) {
+			break;
+		}
+
+		// Verify it's at a valid position (start of statement)
+		bool valid_start = (earliest == 0);
+		if (!valid_start && earliest > 0) {
+			char prev = script[earliest - 1];
+			valid_start = (prev == ';' || prev == '\n' || prev == '\r' ||
+			              prev == '{' || prev == '}' || prev == '(' || prev == ')');
+		}
+
+		if (!valid_start) {
+			pos = earliest + 1;
+			continue;
+		}
+
+		auto [var_name, value_pos] = ExtractAssignment(script, earliest);
+
+		if (var_name.empty() || value_pos == 0) {
+			pos = earliest + 1;
+			continue;
+		}
+
+		// Try to extract JSON value
+		std::string json_value = ExtractJsonValue(script, value_pos);
+
+		if (!json_value.empty()) {
+			// Don't overwrite if already found (first occurrence wins)
+			if (result.variables.find(var_name) == result.variables.end()) {
+				result.variables[var_name] = json_value;
+				result.found = true;
+			}
+		}
+
+		pos = value_pos + 1;
+	}
+}
+
+// Build combined JSON output using yyjson
+static std::string BuildOutputJson(const JsVariablesResult &result) {
+	if (!result.found) {
+		return "";
+	}
+
+	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
+	if (!doc) {
+		return "";
+	}
+
+	yyjson_mut_val *root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+
+	for (const auto &pair : result.variables) {
+		// Parse the JSON value and embed it
+		yyjson_doc *val_doc = yyjson_read(pair.second.c_str(), pair.second.size(), 0);
+		if (val_doc) {
+			yyjson_val *val_root = yyjson_doc_get_root(val_doc);
+			if (val_root) {
+				yyjson_mut_val *copy = yyjson_val_mut_copy(doc, val_root);
+				yyjson_mut_obj_add_val(doc, root, pair.first.c_str(), copy);
+			}
+			yyjson_doc_free(val_doc);
+		}
+	}
+
+	size_t len = 0;
+	char *json_str = yyjson_mut_write(doc, 0, &len);
+	yyjson_mut_doc_free(doc);
+
+	if (!json_str) {
+		return "";
+	}
+
+	std::string result_str(json_str, len);
+	free(json_str);
+	return result_str;
+}
+
+JsVariablesResult ExtractJsVariables(const std::string &html) {
+	JsVariablesResult result;
+
+	if (html.empty()) {
+		return result;
+	}
+
+	// Parse HTML with libxml2
+	JsVarsDocGuard doc(htmlReadMemory(
+		html.c_str(),
+		static_cast<int>(html.size()),
+		nullptr,
+		"UTF-8",
+		HTML_PARSE_RECOVER | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING
+	));
+
+	if (!doc) {
+		return result;
+	}
+
+	xmlNodePtr root = xmlDocGetRootElement(doc.get());
+	if (!root) {
+		return result;
+	}
+
+	// Recursively find script elements
+	std::function<void(xmlNodePtr)> findScripts = [&](xmlNodePtr node) {
+		for (xmlNodePtr cur = node; cur; cur = cur->next) {
+			if (cur->type == XML_ELEMENT_NODE) {
+				if (xmlStrcasecmp(cur->name, BAD_CAST "script") == 0) {
+					// Skip scripts with type that isn't JavaScript
+					xmlChar *type = xmlGetProp(cur, BAD_CAST "type");
+					bool is_js = true;
+					if (type) {
+						std::string type_str(reinterpret_cast<char*>(type));
+						xmlFree(type);
+						// Skip non-JS types like application/ld+json, text/template, etc.
+						if (type_str.find("javascript") == std::string::npos &&
+						    type_str != "text/javascript" &&
+						    type_str != "module" &&
+						    !type_str.empty()) {
+							is_js = false;
+						}
+					}
+
+					if (is_js) {
+						xmlChar *content = xmlNodeGetContent(cur);
+						if (content) {
+							std::string script_content(reinterpret_cast<char*>(content));
+							xmlFree(content);
+							ExtractVariablesFromScript(script_content, result);
+						}
+					}
+				}
+
+				if (cur->children) {
+					findScripts(cur->children);
+				}
+			}
+		}
+	};
+
+	findScripts(root);
+
+	// Build combined JSON
+	result.as_json = BuildOutputJson(result);
+
+	return result;
+}
+
+std::string ExtractJsVariablesAsJson(const std::string &html) {
+	auto result = ExtractJsVariables(html);
+	return result.as_json;
+}
+
+} // namespace duckdb

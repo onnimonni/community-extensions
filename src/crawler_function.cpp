@@ -5,6 +5,7 @@
 #include "sitemap_parser.hpp"
 #include "http_client.hpp"
 #include "link_parser.hpp"
+#include "structured_data.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
@@ -176,6 +177,8 @@ struct CrawlIntoBindData : public TableFunctionData {
 	bool follow_canonical = true;
 	// Multi-threading
 	int num_threads = 0;  // 0 = auto (hardware_concurrency)
+	// Structured data extraction
+	bool extract_js = true;  // Extract JS variables (can be disabled for performance)
 };
 
 struct CrawlIntoGlobalState : public GlobalTableFunctionState {
@@ -201,8 +204,8 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 	// Order: statement_type, source_query, target_table, user_agent, delays..., url_filter, sitemap_cache_hours,
 	//        update_stale, max_retry_backoff_seconds, max_parallel_per_domain, max_total_connections, max_response_bytes,
 	//        compress, accept_content_types, reject_content_types, follow_links, allow_subdomains, max_crawl_pages,
-	//        max_crawl_depth, respect_nofollow, follow_canonical, num_threads
-	if (input.inputs.size() >= 27) {
+	//        max_crawl_depth, respect_nofollow, follow_canonical, num_threads, extract_js
+	if (input.inputs.size() >= 28) {
 		bind_data->statement_type = input.inputs[0].GetValue<int32_t>();
 		bind_data->source_query = StringValue::Get(input.inputs[1]);
 		bind_data->target_table = StringValue::Get(input.inputs[2]);
@@ -230,8 +233,9 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 		bind_data->respect_nofollow = input.inputs[24].GetValue<bool>();
 		bind_data->follow_canonical = input.inputs[25].GetValue<bool>();
 		bind_data->num_threads = input.inputs[26].GetValue<int>();
+		bind_data->extract_js = input.inputs[27].GetValue<bool>();
 	} else {
-		throw BinderException("crawl_into_internal: insufficient parameters (expected 27, got " +
+		throw BinderException("crawl_into_internal: insufficient parameters (expected 28, got " +
 		                      std::to_string(input.inputs.size()) + ")");
 	}
 
@@ -546,6 +550,12 @@ struct BatchCrawlEntry {
 	std::string content_hash;
 	std::string final_url;       // Final URL after redirects
 	int redirect_count;          // Number of redirects followed
+	// Structured data extraction
+	std::string jsonld;          // JSON-LD data as JSON
+	std::string opengraph;       // OpenGraph data as JSON
+	std::string meta;            // Meta tags as JSON
+	std::string hydration;       // Hydration data as JSON
+	std::string js;              // JavaScript variables as JSON
 	bool is_update;
 };
 
@@ -566,7 +576,8 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			                  " SET surt_key = $2, http_status = $3, body = $4, content_type = $5, "
 			                  "elapsed_ms = $6, crawled_at = " + result.timestamp_expr + ", error = $7, "
 			                  "etag = $8, last_modified = $9, content_hash = $10, "
-			                  "final_url = $11, redirect_count = $12 "
+			                  "final_url = $11, redirect_count = $12, "
+			                  "jsonld = $13, opengraph = $14, meta = $15, hydration = $16, js = $17 "
 			                  "WHERE url = $1";
 
 			auto update_result = conn.Query(update_sql, result.url, result.surt_key, result.status_code,
@@ -578,15 +589,22 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			                                 result.last_modified.empty() ? Value() : Value(result.last_modified),
 			                                 result.content_hash.empty() ? Value() : Value(result.content_hash),
 			                                 result.final_url.empty() ? Value() : Value(result.final_url),
-			                                 result.redirect_count);
+			                                 result.redirect_count,
+			                                 result.jsonld.empty() ? Value() : Value(result.jsonld),
+			                                 result.opengraph.empty() ? Value() : Value(result.opengraph),
+			                                 result.meta.empty() ? Value() : Value(result.meta),
+			                                 result.hydration.empty() ? Value() : Value(result.hydration),
+			                                 result.js.empty() ? Value() : Value(result.js));
 
 			if (!update_result->HasError()) {
 				rows_changed++;
 			}
 		} else {
 			auto insert_sql = "INSERT INTO " + quoted_table +
-			                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified, content_hash, final_url, redirect_count) "
-			                  "VALUES ($1, $2, $3, $4, $5, $6, " + result.timestamp_expr + ", $7, $8, $9, $10, $11, $12)";
+			                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, "
+			                  "error, etag, last_modified, content_hash, final_url, redirect_count, "
+			                  "jsonld, opengraph, meta, hydration, js) "
+			                  "VALUES ($1, $2, $3, $4, $5, $6, " + result.timestamp_expr + ", $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)";
 
 			auto insert_result = conn.Query(insert_sql, result.url, result.surt_key, result.status_code,
 			                                 result.body.empty() ? Value() : Value(result.body),
@@ -597,7 +615,12 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			                                 result.last_modified.empty() ? Value() : Value(result.last_modified),
 			                                 result.content_hash.empty() ? Value() : Value(result.content_hash),
 			                                 result.final_url.empty() ? Value() : Value(result.final_url),
-			                                 result.redirect_count);
+			                                 result.redirect_count,
+			                                 result.jsonld.empty() ? Value() : Value(result.jsonld),
+			                                 result.opengraph.empty() ? Value() : Value(result.opengraph),
+			                                 result.meta.empty() ? Value() : Value(result.meta),
+			                                 result.hydration.empty() ? Value() : Value(result.hydration),
+			                                 result.js.empty() ? Value() : Value(result.js));
 
 			if (!insert_result->HasError()) {
 				rows_changed++;
@@ -626,7 +649,12 @@ static void EnsureTargetTable(Connection &conn, const std::string &target_table)
 	           "content_hash VARCHAR, "
 	           "error_type VARCHAR, "
 	           "final_url VARCHAR, "
-	           "redirect_count INTEGER)");
+	           "redirect_count INTEGER, "
+	           "jsonld VARCHAR, "
+	           "opengraph VARCHAR, "
+	           "meta VARCHAR, "
+	           "hydration VARCHAR, "
+	           "js VARCHAR)");
 }
 
 // Input type for CRAWL SITES
@@ -1300,7 +1328,8 @@ static void CrawlWorker(
 				std::string surt_key = GenerateSurtKey(entry.url);
 				local_batch.push_back(BatchCrawlEntry{
 					entry.url, surt_key, -1, "", "", 0, "NOW()",
-					"robots.txt disallow", "", "", "", "", 0, entry.is_update
+					"robots.txt disallow", "", "", "", "", 0,
+					"", "", "", "", "", entry.is_update
 				});
 			}
 			processed_urls.fetch_add(1);
@@ -1425,11 +1454,26 @@ static void CrawlWorker(
 		std::string surt_key = GenerateSurtKey(entry.url);
 		std::string content_hash = GenerateContentHash(response.body);
 
+		// Extract structured data from HTML content
+		std::string jsonld_json, opengraph_json, meta_json, hydration_json, js_json;
+		if (response.success && !response.body.empty() &&
+		    response.content_type.find("text/html") != std::string::npos) {
+			ExtractionConfig config;
+			config.extract_js = bind_data.extract_js;
+			auto structured = ExtractStructuredData(response.body, config);
+			jsonld_json = structured.jsonld;
+			opengraph_json = structured.opengraph;
+			meta_json = structured.meta;
+			hydration_json = structured.hydration;
+			js_json = structured.js;
+		}
+
 		// Add to local batch
 		local_batch.push_back(BatchCrawlEntry{
 			entry.url, surt_key, response.status_code, response.body, response.content_type,
 			fetch_elapsed_ms, timestamp_expr, response.error, response.etag, response.last_modified,
-			content_hash, response.final_url, response.redirect_count, entry.is_update
+			content_hash, response.final_url, response.redirect_count,
+			jsonld_json, opengraph_json, meta_json, hydration_json, js_json, entry.is_update
 		});
 
 		processed_urls.fetch_add(1);
@@ -1785,7 +1829,9 @@ void RegisterCrawlIntoFunction(ExtensionLoader &loader) {
 	                                LogicalType::INTEGER,  // max_crawl_pages
 	                                LogicalType::INTEGER,  // max_crawl_depth
 	                                LogicalType::BOOLEAN,  // respect_nofollow
-	                                LogicalType::BOOLEAN}, // follow_canonical
+	                                LogicalType::BOOLEAN,  // follow_canonical
+	                                LogicalType::INTEGER,  // num_threads
+	                                LogicalType::BOOLEAN}, // extract_js
 	                               CrawlIntoFunction, CrawlIntoBind, CrawlIntoInitGlobal);
 
 	// Set progress callback for progress bar integration

@@ -54,6 +54,9 @@ struct CrawlParseData : public ParserExtensionParseData {
 	// Multi-threading
 	int num_threads = 0;                  // 0 = auto (hardware_concurrency)
 
+	// Structured data extraction
+	bool extract_js = true;               // Extract JS variables (can be disabled for performance)
+
 	unique_ptr<ParserExtensionParseData> Copy() const override;
 	string ToString() const override;
 };
