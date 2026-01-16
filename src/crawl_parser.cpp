@@ -41,6 +41,7 @@ unique_ptr<ParserExtensionParseData> CrawlParseData::Copy() const {
 	copy->follow_canonical = follow_canonical;
 	copy->num_threads = num_threads;
 	copy->extract_js = extract_js;
+	copy->extract_specs = extract_specs;
 	return copy;
 }
 
@@ -61,6 +62,27 @@ static string Trim(const string &str) {
 		end--;
 	}
 	return str.substr(start, end - start);
+}
+
+// Find keyword as standalone word (not part of identifier)
+// Returns position or string::npos if not found
+static size_t FindKeyword(const string &str, const string &keyword) {
+	size_t pos = 0;
+	while ((pos = str.find(keyword, pos)) != string::npos) {
+		// Check if preceded by whitespace or start
+		bool valid_start = (pos == 0 || !std::isalnum(str[pos - 1]) && str[pos - 1] != '_');
+		// Check if followed by whitespace, '(', or end
+		size_t after = pos + keyword.length();
+		bool valid_end = (after >= str.length() ||
+		                  std::isspace(str[after]) ||
+		                  str[after] == '(' ||
+		                  (!std::isalnum(str[after]) && str[after] != '_'));
+		if (valid_start && valid_end) {
+			return pos;
+		}
+		pos++;
+	}
+	return string::npos;
 }
 
 // Find matching closing parenthesis
@@ -210,6 +232,126 @@ static bool ParseWithOptions(const string &options_str, CrawlParseData &data) {
 	return true;
 }
 
+// Parse EXTRACT clause: EXTRACT (expr AS alias, expr2 AS alias2, ...)
+static bool ParseExtractClause(const string &extract_str, CrawlParseData &data) {
+	// Remove outer parentheses
+	string content = Trim(extract_str);
+	if (!content.empty() && content.front() == '(' && content.back() == ')') {
+		content = content.substr(1, content.length() - 2);
+	}
+
+	// Split by comma (respecting nested parentheses and quotes)
+	vector<string> specs;
+	size_t pos = 0;
+	size_t start = 0;
+	int paren_depth = 0;
+	bool in_string = false;
+	char string_char = 0;
+
+	while (pos < content.length()) {
+		char c = content[pos];
+
+		if (!in_string && (c == '\'' || c == '"')) {
+			in_string = true;
+			string_char = c;
+		} else if (in_string && c == string_char) {
+			in_string = false;
+		} else if (!in_string) {
+			if (c == '(') {
+				paren_depth++;
+			} else if (c == ')') {
+				paren_depth--;
+			} else if (c == ',' && paren_depth == 0) {
+				specs.push_back(Trim(content.substr(start, pos - start)));
+				start = pos + 1;
+			}
+		}
+		pos++;
+	}
+	// Add last spec
+	if (start < content.length()) {
+		specs.push_back(Trim(content.substr(start)));
+	}
+
+	// Parse each spec: "expr AS alias" or "expr as alias"
+	for (const auto &spec_str : specs) {
+		if (spec_str.empty()) {
+			continue;
+		}
+
+		ExtractSpec spec;
+
+		// Find " AS " or " as " (case-insensitive, with spaces)
+		string spec_lower = StringUtil::Lower(spec_str);
+		size_t as_pos = spec_lower.rfind(" as ");
+		if (as_pos == string::npos) {
+			// No alias - use last part of expression as alias
+			// e.g., jsonld->'Product'->>'name' -> alias is 'name'
+			size_t arrow_pos = spec_str.rfind("->>");
+			if (arrow_pos == string::npos) {
+				arrow_pos = spec_str.rfind("->");
+			}
+			if (arrow_pos != string::npos) {
+				string last_part = spec_str.substr(arrow_pos + (spec_str[arrow_pos + 2] == '>' ? 3 : 2));
+				last_part = Trim(last_part);
+				// Remove quotes from 'name'
+				if (last_part.length() >= 2 && last_part.front() == '\'' && last_part.back() == '\'') {
+					last_part = last_part.substr(1, last_part.length() - 2);
+				}
+				spec.alias = last_part;
+			} else {
+				// No arrow, use whole expression as alias
+				spec.alias = spec_str;
+			}
+			spec.expression = spec_str;
+		} else {
+			spec.expression = Trim(spec_str.substr(0, as_pos));
+			spec.alias = Trim(spec_str.substr(as_pos + 4));
+		}
+
+		// Determine if expression ends with ->> (text) or -> (json)
+		spec.is_text = (spec.expression.find("->>") != string::npos &&
+		                spec.expression.rfind("->>") > spec.expression.rfind("->'" ));
+
+		data.extract_specs.push_back(spec);
+	}
+
+	return !data.extract_specs.empty();
+}
+
+// Serialize extract_specs to JSON string for parameter passing
+static string SerializeExtractSpecs(const vector<ExtractSpec> &specs) {
+	if (specs.empty()) {
+		return "[]";
+	}
+
+	string json = "[";
+	for (size_t i = 0; i < specs.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		// Escape quotes in expression and alias
+		string expr = specs[i].expression;
+		string alias = specs[i].alias;
+		// Simple escape: replace " with \"
+		size_t pos = 0;
+		while ((pos = expr.find('"', pos)) != string::npos) {
+			expr.replace(pos, 1, "\\\"");
+			pos += 2;
+		}
+		pos = 0;
+		while ((pos = alias.find('"', pos)) != string::npos) {
+			alias.replace(pos, 1, "\\\"");
+			pos += 2;
+		}
+
+		json += "{\"expr\":\"" + expr + "\",\"alias\":\"" + alias + "\",\"is_text\":" +
+		        (specs[i].is_text ? "true" : "false") + "}";
+	}
+	json += "]";
+	return json;
+}
+
 //===--------------------------------------------------------------------===//
 // CrawlParserExtension
 //===--------------------------------------------------------------------===//
@@ -257,19 +399,23 @@ ParserExtensionParseResult CrawlParserExtension::ParseCrawl(ParserExtensionInfo 
 		return ParserExtensionParseResult("CRAWL syntax error: expected INTO after source query");
 	}
 
-	// Extract table name (everything after INTO until WHERE or WITH or end)
+	// Extract table name (everything after INTO until WHERE, EXTRACT, WITH, or LIMIT)
 	string after_into = Trim(remainder.substr(into_pos + 4));
 	string after_into_lower = StringUtil::Lower(after_into);
 
-	size_t where_pos = after_into_lower.find("where");
-	size_t with_pos = after_into_lower.find("with");
+	// Use FindKeyword to avoid matching keywords inside identifiers (e.g., test_extract)
+	size_t where_pos = FindKeyword(after_into_lower, "where");
+	size_t extract_pos = FindKeyword(after_into_lower, "extract");
+	size_t with_pos = FindKeyword(after_into_lower, "with");
+	size_t limit_pos = FindKeyword(after_into_lower, "limit");
 
-	// Determine where table name ends
+	// Determine where table name ends (first keyword found)
 	size_t table_end = string::npos;
-	if (where_pos != string::npos && (with_pos == string::npos || where_pos < with_pos)) {
-		table_end = where_pos;
-	} else if (with_pos != string::npos) {
-		table_end = with_pos;
+	vector<size_t> positions = {where_pos, extract_pos, with_pos, limit_pos};
+	for (size_t pos : positions) {
+		if (pos != string::npos && (table_end == string::npos || pos < table_end)) {
+			table_end = pos;
+		}
 	}
 
 	if (table_end != string::npos) {
@@ -317,8 +463,47 @@ ParserExtensionParseResult CrawlParserExtension::ParseCrawl(ParserExtensionInfo 
 		}
 	}
 
-	// Find LIMIT position (can be after WITH or after table name)
-	size_t limit_pos = after_into_lower.find("limit");
+	// Parse EXTRACT clause if present
+	if (extract_pos != string::npos) {
+		string after_extract = after_into.substr(extract_pos + 7); // skip "extract"
+		string after_extract_trimmed = Trim(after_extract);
+
+		if (!after_extract_trimmed.empty() && after_extract_trimmed.front() == '(') {
+			size_t extract_paren_end = FindClosingParen(after_extract_trimmed, 0);
+			if (extract_paren_end != string::npos) {
+				string extract_content = after_extract_trimmed.substr(0, extract_paren_end + 1);
+				if (!ParseExtractClause(extract_content, *data)) {
+					return ParserExtensionParseResult("CRAWL syntax error: invalid EXTRACT clause");
+				}
+
+				// Recalculate with_pos and limit_pos by searching in the remaining text
+				string remaining_after_extract = after_extract_trimmed.substr(extract_paren_end + 1);
+				string remaining_lower = StringUtil::Lower(remaining_after_extract);
+
+				// Calculate proper offset: extract_pos + "extract" + trimmed whitespace + paren content + 1
+				size_t trim_offset = after_extract.length() - after_extract_trimmed.length();
+				size_t base_offset = extract_pos + 7 + trim_offset + extract_paren_end + 1;
+
+				size_t with_in_remaining = FindKeyword(remaining_lower, "with");
+				if (with_in_remaining != string::npos) {
+					with_pos = base_offset + with_in_remaining;
+				} else {
+					with_pos = string::npos; // WITH not after EXTRACT
+				}
+
+				size_t limit_in_remaining = FindKeyword(remaining_lower, "limit");
+				if (limit_in_remaining != string::npos) {
+					limit_pos = base_offset + limit_in_remaining;
+				} else {
+					limit_pos = string::npos; // LIMIT not after EXTRACT
+				}
+			} else {
+				return ParserExtensionParseResult("CRAWL syntax error: unmatched parenthesis in EXTRACT clause");
+			}
+		} else {
+			return ParserExtensionParseResult("CRAWL syntax error: EXTRACT must be followed by parentheses");
+		}
+	}
 
 	// Parse WITH clause if present
 	if (with_pos != string::npos) {
@@ -434,6 +619,7 @@ ParserExtensionPlanResult CrawlParserExtension::PlanCrawl(ParserExtensionInfo *i
 	result.parameters.push_back(Value(data.follow_canonical));
 	result.parameters.push_back(Value(data.num_threads));
 	result.parameters.push_back(Value(data.extract_js));
+	result.parameters.push_back(Value(SerializeExtractSpecs(data.extract_specs)));
 
 	result.requires_valid_transaction = true;
 	result.return_type = StatementReturnType::CHANGED_ROWS;

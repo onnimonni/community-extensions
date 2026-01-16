@@ -462,4 +462,20 @@ std::string QuoteSqlIdentifier(const std::string &identifier) {
 	return escaped;
 }
 
+std::string EscapeSqlString(const std::string &value) {
+	// Escape any embedded single quotes by doubling them
+	std::string escaped;
+	escaped.reserve(value.length() + 4);
+	escaped += '\'';
+	for (char c : value) {
+		if (c == '\'') {
+			escaped += "''";
+		} else {
+			escaped += c;
+		}
+	}
+	escaped += '\'';
+	return escaped;
+}
+
 } // namespace duckdb

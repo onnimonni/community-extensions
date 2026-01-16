@@ -6,6 +6,8 @@
 #include "http_client.hpp"
 #include "link_parser.hpp"
 #include "structured_data.hpp"
+#include "json_path_evaluator.hpp"
+#include "crawl_parser.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
@@ -179,6 +181,10 @@ struct CrawlIntoBindData : public TableFunctionData {
 	int num_threads = 0;  // 0 = auto (hardware_concurrency)
 	// Structured data extraction
 	bool extract_js = true;  // Extract JS variables (can be disabled for performance)
+	// EXTRACT clause - custom column extraction
+	std::string extract_specs_json;  // JSON serialized extract specs
+	std::vector<ExtractSpec> extract_specs;  // Parsed extract specs
+	std::vector<JsonPath> extract_paths;  // Parsed JSON paths for each spec
 };
 
 struct CrawlIntoGlobalState : public GlobalTableFunctionState {
@@ -205,7 +211,7 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 	//        update_stale, max_retry_backoff_seconds, max_parallel_per_domain, max_total_connections, max_response_bytes,
 	//        compress, accept_content_types, reject_content_types, follow_links, allow_subdomains, max_crawl_pages,
 	//        max_crawl_depth, respect_nofollow, follow_canonical, num_threads, extract_js
-	if (input.inputs.size() >= 28) {
+	if (input.inputs.size() >= 29) {
 		bind_data->statement_type = input.inputs[0].GetValue<int32_t>();
 		bind_data->source_query = StringValue::Get(input.inputs[1]);
 		bind_data->target_table = StringValue::Get(input.inputs[2]);
@@ -234,8 +240,53 @@ static unique_ptr<FunctionData> CrawlIntoBind(ClientContext &context, TableFunct
 		bind_data->follow_canonical = input.inputs[25].GetValue<bool>();
 		bind_data->num_threads = input.inputs[26].GetValue<int>();
 		bind_data->extract_js = input.inputs[27].GetValue<bool>();
+		bind_data->extract_specs_json = StringValue::Get(input.inputs[28]);
+
+		// Parse extract_specs_json into extract_specs and extract_paths
+		if (!bind_data->extract_specs_json.empty() && bind_data->extract_specs_json != "[]") {
+			// Simple JSON parsing for extract specs
+			// Format: [{"expr":"...","alias":"...","is_text":true/false},...]
+			std::string json = bind_data->extract_specs_json;
+			size_t pos = 0;
+			while ((pos = json.find("{\"expr\":", pos)) != std::string::npos) {
+				ExtractSpec spec;
+
+				// Extract expr
+				size_t expr_start = json.find(":\"", pos) + 2;
+				size_t expr_end = json.find("\",\"alias\"", expr_start);
+				if (expr_end != std::string::npos) {
+					spec.expression = json.substr(expr_start, expr_end - expr_start);
+					// Unescape quotes
+					size_t quote_pos = 0;
+					while ((quote_pos = spec.expression.find("\\\"", quote_pos)) != std::string::npos) {
+						spec.expression.replace(quote_pos, 2, "\"");
+						quote_pos++;
+					}
+				}
+
+				// Extract alias
+				size_t alias_start = json.find("\"alias\":\"", pos);
+				if (alias_start != std::string::npos) {
+					alias_start += 9;
+					size_t alias_end = json.find("\",\"is_text\"", alias_start);
+					if (alias_end != std::string::npos) {
+						spec.alias = json.substr(alias_start, alias_end - alias_start);
+					}
+				}
+
+				// Extract is_text
+				size_t is_text_pos = json.find("\"is_text\":", pos);
+				if (is_text_pos != std::string::npos) {
+					spec.is_text = (json.find("true", is_text_pos) < json.find("}", is_text_pos));
+				}
+
+				bind_data->extract_specs.push_back(spec);
+				bind_data->extract_paths.push_back(ParseJsonPath(spec.expression));
+				pos++;
+			}
+		}
 	} else {
-		throw BinderException("crawl_into_internal: insufficient parameters (expected 28, got " +
+		throw BinderException("crawl_into_internal: insufficient parameters (expected 29, got " +
 		                      std::to_string(input.inputs.size()) + ")");
 	}
 
@@ -557,11 +608,14 @@ struct BatchCrawlEntry {
 	std::string hydration;       // Hydration data as JSON
 	std::string js;              // JavaScript variables as JSON
 	bool is_update;
+	// EXTRACT clause - extracted values (parallel to extract_specs)
+	std::vector<std::string> extracted_values;
 };
 
 // Flush batch of results to database
 static int64_t FlushBatch(Connection &conn, const std::string &target_table,
-                           std::vector<BatchCrawlEntry> &batch) {
+                           std::vector<BatchCrawlEntry> &batch,
+                           const std::vector<ExtractSpec> &extract_specs) {
 	if (batch.empty()) {
 		return 0;
 	}
@@ -570,8 +624,43 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 
 	auto quoted_table = QuoteSqlIdentifier(target_table);
 
+	// Check if using EXTRACT mode (dynamic schema)
+	bool use_extract_mode = !extract_specs.empty();
+
 	for (const auto &result : batch) {
-		if (result.is_update) {
+		if (use_extract_mode) {
+			// EXTRACT mode - dynamic columns with literal values
+			std::string columns = "url, surt_key, http_status, crawled_at, error";
+			std::string values_part = EscapeSqlString(result.url) + ", " +
+			                          EscapeSqlString(result.surt_key) + ", " +
+			                          std::to_string(result.status_code) + ", " +
+			                          result.timestamp_expr + ", " +
+			                          (result.error.empty() ? "NULL" : EscapeSqlString(result.error));
+
+			for (size_t i = 0; i < extract_specs.size(); i++) {
+				columns += ", " + QuoteSqlIdentifier(extract_specs[i].alias);
+				if (i < result.extracted_values.size()) {
+					values_part += ", " + (result.extracted_values[i].empty() ? "NULL" : EscapeSqlString(result.extracted_values[i]));
+				} else {
+					values_part += ", NULL";
+				}
+			}
+
+			auto insert_sql = "INSERT INTO " + quoted_table + " (" + columns + ") VALUES (" + values_part + ")"
+			                  " ON CONFLICT (url) DO UPDATE SET surt_key = EXCLUDED.surt_key, http_status = EXCLUDED.http_status, "
+			                  "crawled_at = EXCLUDED.crawled_at, error = EXCLUDED.error";
+
+			// Build SET clause for extracted columns
+			for (const auto &spec : extract_specs) {
+				insert_sql += ", " + QuoteSqlIdentifier(spec.alias) + " = EXCLUDED." + QuoteSqlIdentifier(spec.alias);
+			}
+
+			auto query_result = conn.Query(insert_sql);
+			if (!query_result->HasError()) {
+				rows_changed++;
+			}
+		} else if (result.is_update) {
+			// Standard mode - update existing row
 			auto update_sql = "UPDATE " + quoted_table +
 			                  " SET surt_key = $2, http_status = $3, body = $4, content_type = $5, "
 			                  "elapsed_ms = $6, crawled_at = " + result.timestamp_expr + ", error = $7, "
@@ -600,6 +689,7 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 				rows_changed++;
 			}
 		} else {
+			// Standard mode - insert new row
 			auto insert_sql = "INSERT INTO " + quoted_table +
 			                  " (url, surt_key, http_status, body, content_type, elapsed_ms, crawled_at, "
 			                  "error, etag, last_modified, content_hash, final_url, redirect_count, "
@@ -634,27 +724,45 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 
 //===--------------------------------------------------------------------===//
 // Ensure target table exists for crawl results
-static void EnsureTargetTable(Connection &conn, const std::string &target_table) {
-	conn.Query("CREATE TABLE IF NOT EXISTS " + QuoteSqlIdentifier(target_table) + " ("
-	           "url VARCHAR PRIMARY KEY, "
-	           "surt_key VARCHAR, "
-	           "http_status INTEGER, "
-	           "body VARCHAR, "
-	           "content_type VARCHAR, "
-	           "elapsed_ms BIGINT, "
-	           "crawled_at TIMESTAMP, "
-	           "error VARCHAR, "
-	           "etag VARCHAR, "
-	           "last_modified VARCHAR, "
-	           "content_hash VARCHAR, "
-	           "error_type VARCHAR, "
-	           "final_url VARCHAR, "
-	           "redirect_count INTEGER, "
-	           "jsonld VARCHAR, "
-	           "opengraph VARCHAR, "
-	           "meta VARCHAR, "
-	           "hydration VARCHAR, "
-	           "js VARCHAR)");
+static void EnsureTargetTable(Connection &conn, const std::string &target_table,
+                               const std::vector<ExtractSpec> &extract_specs) {
+	if (extract_specs.empty()) {
+		// Default fixed schema (backward compatibility)
+		conn.Query("CREATE TABLE IF NOT EXISTS " + QuoteSqlIdentifier(target_table) + " ("
+		           "url VARCHAR PRIMARY KEY, "
+		           "surt_key VARCHAR, "
+		           "http_status INTEGER, "
+		           "body VARCHAR, "
+		           "content_type VARCHAR, "
+		           "elapsed_ms BIGINT, "
+		           "crawled_at TIMESTAMP, "
+		           "error VARCHAR, "
+		           "etag VARCHAR, "
+		           "last_modified VARCHAR, "
+		           "content_hash VARCHAR, "
+		           "error_type VARCHAR, "
+		           "final_url VARCHAR, "
+		           "redirect_count INTEGER, "
+		           "jsonld VARCHAR, "
+		           "opengraph VARCHAR, "
+		           "meta VARCHAR, "
+		           "hydration VARCHAR, "
+		           "js VARCHAR)");
+	} else {
+		// Dynamic schema based on EXTRACT clause
+		std::string sql = "CREATE TABLE IF NOT EXISTS " + QuoteSqlIdentifier(target_table) + " ("
+		                  "url VARCHAR PRIMARY KEY, "
+		                  "surt_key VARCHAR, "
+		                  "http_status INTEGER, "
+		                  "crawled_at TIMESTAMP, "
+		                  "error VARCHAR";
+
+		for (const auto &spec : extract_specs) {
+			sql += ", " + QuoteSqlIdentifier(spec.alias) + " VARCHAR";
+		}
+		sql += ")";
+		conn.Query(sql);
+	}
 }
 
 // Input type for CRAWL SITES
@@ -1463,13 +1571,54 @@ static void CrawlWorker(
 			js_json = structured.js;
 		}
 
+		// Evaluate EXTRACT expressions if present
+		std::vector<std::string> extracted_values;
+		if (!bind_data.extract_paths.empty()) {
+			for (size_t i = 0; i < bind_data.extract_paths.size(); i++) {
+				const auto &path = bind_data.extract_paths[i];
+				std::string source_json;
+
+				// Get source JSON based on base column
+				if (path.base_column == "jsonld") {
+					source_json = jsonld_json;
+				} else if (path.base_column == "opengraph") {
+					source_json = opengraph_json;
+				} else if (path.base_column == "meta") {
+					source_json = meta_json;
+				} else if (path.base_column == "hydration") {
+					source_json = hydration_json;
+				} else if (path.base_column == "js") {
+					source_json = js_json;
+				}
+
+				std::string value = EvaluateJsonPath(source_json, path);
+				extracted_values.push_back(value);
+			}
+		}
+
 		// Add to local batch
-		local_batch.push_back(BatchCrawlEntry{
-			entry.url, surt_key, response.status_code, response.body, response.content_type,
-			fetch_elapsed_ms, timestamp_expr, response.error, response.etag, response.last_modified,
-			content_hash, response.final_url, response.redirect_count,
-			jsonld_json, opengraph_json, meta_json, hydration_json, js_json, entry.is_update
-		});
+		BatchCrawlEntry batch_entry;
+		batch_entry.url = entry.url;
+		batch_entry.surt_key = surt_key;
+		batch_entry.status_code = response.status_code;
+		batch_entry.body = response.body;
+		batch_entry.content_type = response.content_type;
+		batch_entry.elapsed_ms = fetch_elapsed_ms;
+		batch_entry.timestamp_expr = timestamp_expr;
+		batch_entry.error = response.error;
+		batch_entry.etag = response.etag;
+		batch_entry.last_modified = response.last_modified;
+		batch_entry.content_hash = content_hash;
+		batch_entry.final_url = response.final_url;
+		batch_entry.redirect_count = response.redirect_count;
+		batch_entry.jsonld = jsonld_json;
+		batch_entry.opengraph = opengraph_json;
+		batch_entry.meta = meta_json;
+		batch_entry.hydration = hydration_json;
+		batch_entry.js = js_json;
+		batch_entry.is_update = entry.is_update;
+		batch_entry.extracted_values = extracted_values;
+		local_batch.push_back(std::move(batch_entry));
 
 		processed_urls.fetch_add(1);
 
@@ -1484,7 +1633,7 @@ static void CrawlWorker(
 			// Flush shared batch if large enough
 			if (result_batch.size() >= 100) {
 				std::lock_guard<std::mutex> db_lock(db_mutex);
-				rows_changed.fetch_add(FlushBatch(conn, bind_data.target_table, result_batch));
+				rows_changed.fetch_add(FlushBatch(conn, bind_data.target_table, result_batch, bind_data.extract_specs));
 			}
 		}
 
@@ -1575,7 +1724,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 	std::unordered_map<std::string, DomainState> domain_states;
 
 	// Ensure target table exists for results
-	EnsureTargetTable(conn, bind_data.target_table);
+	EnsureTargetTable(conn, bind_data.target_table, bind_data.extract_specs);
 
 	auto crawl_start_time = std::chrono::steady_clock::now();
 
@@ -1764,7 +1913,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		if (!result_batch.empty()) {
 			std::lock_guard<std::mutex> db_lock(db_mutex);
-			rows_changed.fetch_add(FlushBatch(conn, bind_data.target_table, result_batch));
+			rows_changed.fetch_add(FlushBatch(conn, bind_data.target_table, result_batch, bind_data.extract_specs));
 		}
 	}
 

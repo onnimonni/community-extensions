@@ -96,4 +96,7 @@ bool IsValidSqlIdentifier(const std::string &identifier);
 // Quote identifier for safe use in SQL (double quotes, escape embedded quotes)
 std::string QuoteSqlIdentifier(const std::string &identifier);
 
+// Escape string value for SQL (single quotes, escape embedded quotes)
+std::string EscapeSqlString(const std::string &value);
+
 } // namespace duckdb

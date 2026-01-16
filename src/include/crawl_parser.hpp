@@ -10,6 +10,13 @@ enum class CrawlStatementType : uint8_t {
 	CRAWL      // CRAWL (...) INTO table
 };
 
+// Specification for a single EXTRACT column
+struct ExtractSpec {
+	string expression;  // e.g., "jsonld->'Product'->>'name'"
+	string alias;       // e.g., "name"
+	bool is_text;       // true for ->> (text), false for -> (json)
+};
+
 // Parsed data from CRAWL statement
 struct CrawlParseData : public ParserExtensionParseData {
 	CrawlStatementType statement_type = CrawlStatementType::CRAWL;
@@ -56,6 +63,9 @@ struct CrawlParseData : public ParserExtensionParseData {
 
 	// Structured data extraction
 	bool extract_js = true;               // Extract JS variables (can be disabled for performance)
+
+	// EXTRACT clause - custom column extraction
+	vector<ExtractSpec> extract_specs;    // Empty = use default schema
 
 	unique_ptr<ParserExtensionParseData> Copy() const override;
 	string ToString() const override;

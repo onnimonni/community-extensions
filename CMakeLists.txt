@@ -51,6 +51,7 @@ set(EXTENSION_SOURCES
     src/hydration_extractor.cpp
     src/js_variables_extractor.cpp
     src/structured_data.cpp
+    src/json_path_evaluator.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
