@@ -3,10 +3,8 @@
 -- Prerequisites: Start local server with zoho-career.html in /tmp:
 --   python3 -m http.server 48765 --directory /tmp
 
--- Load extensions
+-- Load extension (json is autoloaded)
 LOAD 'build/release/extension/crawler/crawler.duckdb_extension';
-INSTALL json;
-LOAD json;
 
 -- Crawl the local zoho career page (LIMIT is pushed down to crawler)
 CRAWL (SELECT 'http://localhost:48765/zoho-career.html') INTO zoho_raw
@@ -19,10 +17,9 @@ WITH jobs_json AS (
     SELECT
         url,
         crawled_at,
-        json(js::JSON->>'jobs') as jobs_array
+        json(js->>'jobs') as jobs_array
     FROM zoho_raw
-    WHERE js IS NOT NULL  -- empty results stored as NULL, not ''
-      AND json_valid(js::JSON->>'jobs')
+    WHERE json_valid(js->>'jobs')  -- js is '{}' when empty, ->>'jobs' is NULL
 )
 SELECT
     json_extract_string(job.j, '$.id') as job_id,

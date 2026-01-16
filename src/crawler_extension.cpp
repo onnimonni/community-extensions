@@ -7,6 +7,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
@@ -15,6 +16,9 @@ namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
+
+	// Autoload json extension for structured data columns
+	ExtensionHelper::TryAutoLoadExtension(db, "json");
 
 	// Register crawler_user_agent setting
 	config.AddExtensionOption("crawler_user_agent",

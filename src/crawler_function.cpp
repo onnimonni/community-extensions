@@ -590,11 +590,11 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			                                 result.content_hash.empty() ? Value() : Value(result.content_hash),
 			                                 result.final_url.empty() ? Value() : Value(result.final_url),
 			                                 result.redirect_count,
-			                                 result.jsonld.empty() ? Value() : Value(result.jsonld),
-			                                 result.opengraph.empty() ? Value() : Value(result.opengraph),
-			                                 result.meta.empty() ? Value() : Value(result.meta),
-			                                 result.hydration.empty() ? Value() : Value(result.hydration),
-			                                 result.js.empty() ? Value() : Value(result.js));
+			                                 result.jsonld.empty() ? Value("{}") : Value(result.jsonld),
+			                                 result.opengraph.empty() ? Value("{}") : Value(result.opengraph),
+			                                 result.meta.empty() ? Value("{}") : Value(result.meta),
+			                                 result.hydration.empty() ? Value("{}") : Value(result.hydration),
+			                                 result.js.empty() ? Value("{}") : Value(result.js));
 
 			if (!update_result->HasError()) {
 				rows_changed++;
@@ -616,11 +616,11 @@ static int64_t FlushBatch(Connection &conn, const std::string &target_table,
 			                                 result.content_hash.empty() ? Value() : Value(result.content_hash),
 			                                 result.final_url.empty() ? Value() : Value(result.final_url),
 			                                 result.redirect_count,
-			                                 result.jsonld.empty() ? Value() : Value(result.jsonld),
-			                                 result.opengraph.empty() ? Value() : Value(result.opengraph),
-			                                 result.meta.empty() ? Value() : Value(result.meta),
-			                                 result.hydration.empty() ? Value() : Value(result.hydration),
-			                                 result.js.empty() ? Value() : Value(result.js));
+			                                 result.jsonld.empty() ? Value("{}") : Value(result.jsonld),
+			                                 result.opengraph.empty() ? Value("{}") : Value(result.opengraph),
+			                                 result.meta.empty() ? Value("{}") : Value(result.meta),
+			                                 result.hydration.empty() ? Value("{}") : Value(result.hydration),
+			                                 result.js.empty() ? Value("{}") : Value(result.js));
 
 			if (!insert_result->HasError()) {
 				rows_changed++;
