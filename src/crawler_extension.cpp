@@ -3,6 +3,10 @@
 #include "crawler_extension.hpp"
 #include "crawler_function.hpp"
 #include "crawl_parser.hpp"
+#include "css_extract_function.hpp"
+#include "crawl_stream_function.hpp"
+#include "crawl_table_function.hpp"
+#include "sitemap_function.hpp"
 #include "http_client.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -37,6 +41,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register crawl_into_internal() table function for CRAWL INTO syntax
 	RegisterCrawlIntoFunction(loader);
+
+	// Register $() scalar function for CSS extraction
+	RegisterCssExtractFunction(loader);
+
+	// Register crawl_stream table function for streaming crawl results
+	RegisterCrawlStreamFunction(loader);
+
+	// Register crawl() table function for clean FROM-based crawling
+	RegisterCrawlTableFunction(loader);
+
+	// Register sitemap() table function for sitemap parsing
+	RegisterSitemapFunction(loader);
 
 	// Register CRAWL parser extension
 	ParserExtension parser_ext;

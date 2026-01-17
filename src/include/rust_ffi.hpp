@@ -6,83 +6,54 @@
 
 namespace duckdb {
 
-#if defined(RUST_PARSER_AVAILABLE) && RUST_PARSER_AVAILABLE
+// Build JSON request from ExtractSpecs for Rust FFI
+std::string BuildExtractionRequest(const std::vector<ExtractSpec> &specs);
 
-// C-compatible struct matching Rust's ExtractionResultFFI
-extern "C" {
-struct ExtractionResultFFI {
-    char *json_ptr;   // JSON-serialized result (owned by Rust)
-    char *error_ptr;  // Error message or null (owned by Rust)
+// Call Rust parser to extract data from HTML
+// Returns JSON string with extracted values
+std::string ExtractWithRust(const std::string &html, const std::string &request_json);
+
+// Parse Rust extraction result JSON into value vector
+std::vector<std::string> ParseExtractionResult(const std::string &result_json,
+                                                const std::vector<ExtractSpec> &specs);
+
+// Expanded extraction result for array expansion
+struct ExpandedExtractionResult {
+	std::vector<std::string> values;  // Regular values (one per spec)
+	std::vector<std::vector<std::string>> expanded;  // Expanded arrays (one per spec, empty if not expanded)
+	bool has_expansion;  // True if any spec has expand_array=true and returned multiple values
 };
 
-// FFI functions exported from Rust
-ExtractionResultFFI extract_from_html(const char *html_ptr, size_t html_len,
-                                       const char *request_json);
-void free_extraction_result(ExtractionResultFFI result);
+// Parse Rust extraction result with support for expanded arrays
+ExpandedExtractionResult ParseExtractionResultExpanded(const std::string &result_json,
+                                                        const std::vector<ExtractSpec> &specs);
 
-ExtractionResultFFI extract_jsonld_ffi(const char *html_ptr, size_t html_len);
-ExtractionResultFFI extract_microdata_ffi(const char *html_ptr, size_t html_len);
-ExtractionResultFFI extract_opengraph_ffi(const char *html_ptr, size_t html_len);
-ExtractionResultFFI extract_js_ffi(const char *html_ptr, size_t html_len);
-ExtractionResultFFI extract_css_ffi(const char *html_ptr, size_t html_len,
-                                     const char *selector);
-}
+// Check if Rust parser is available
+bool IsRustParserAvailable();
 
-#endif // RUST_PARSER_AVAILABLE
+// Get Rust parser version
+std::string GetRustParserVersion();
 
-// C++ wrapper functions
-
-#if defined(RUST_PARSER_AVAILABLE) && RUST_PARSER_AVAILABLE
-
-// RAII wrapper for ExtractionResultFFI
-class RustExtractionResult {
-public:
-    explicit RustExtractionResult(ExtractionResultFFI result) : result_(result) {}
-
-    ~RustExtractionResult() {
-        free_extraction_result(result_);
-    }
-
-    RustExtractionResult(const RustExtractionResult &) = delete;
-    RustExtractionResult &operator=(const RustExtractionResult &) = delete;
-
-    RustExtractionResult(RustExtractionResult &&other) noexcept : result_(other.result_) {
-        other.result_ = {nullptr, nullptr};
-    }
-
-    bool HasError() const { return result_.error_ptr != nullptr; }
-    std::string GetError() const {
-        return result_.error_ptr ? std::string(result_.error_ptr) : "";
-    }
-    std::string GetJson() const {
-        return result_.json_ptr ? std::string(result_.json_ptr) : "";
-    }
-
-private:
-    ExtractionResultFFI result_;
-};
-
-// High-level extraction function
-// Takes HTML and ExtractSpec list, returns extracted values as JSON strings
-std::vector<std::string> ExtractWithRust(const std::string &html,
-                                          const std::vector<ExtractSpec> &specs);
-
-// Convenience extraction functions
+// Convenience extractors - return JSON strings
 std::string ExtractJsonLdWithRust(const std::string &html);
 std::string ExtractMicrodataWithRust(const std::string &html);
 std::string ExtractOpenGraphWithRust(const std::string &html);
 std::string ExtractJsWithRust(const std::string &html);
 std::string ExtractCssWithRust(const std::string &html, const std::string &selector);
 
-#endif // RUST_PARSER_AVAILABLE
+// Batch crawl + extract (HTTP done in Rust)
+// Takes JSON request: {"urls": [...], "extraction": {...}, "user_agent": "...", "timeout_ms": 30000, "concurrency": 4}
+// Returns JSON response: {"results": [{url, status, content_type, body, error, extracted, response_time_ms}, ...]}
+std::string CrawlBatchWithRust(const std::string &request_json);
 
-// Check if Rust parser is available at compile time
-inline bool IsRustParserAvailable() {
-#if defined(RUST_PARSER_AVAILABLE) && RUST_PARSER_AVAILABLE
-    return true;
-#else
-    return false;
-#endif
-}
+// Fetch and parse sitemap(s)
+// Takes JSON request: {"url": "...", "recursive": true, "max_depth": 5, "discover_from_robots": false}
+// Returns JSON response: {"urls": [{url, lastmod, changefreq, priority}, ...], "sitemaps": [...], "errors": [...]}
+std::string FetchSitemapWithRust(const std::string &request_json);
+
+// Check robots.txt for a URL
+// Takes JSON request: {"url": "...", "user_agent": "..."}
+// Returns JSON response: {"allowed": true, "crawl_delay": 1.0, "sitemaps": [...]}
+std::string CheckRobotsWithRust(const std::string &request_json);
 
 } // namespace duckdb

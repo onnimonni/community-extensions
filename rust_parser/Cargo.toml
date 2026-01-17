@@ -5,26 +5,27 @@ edition = "2021"
 
 [lib]
 crate-type = ["staticlib"]
-name = "rust_parser"
 
 [dependencies]
-# HTML parsing
-scraper = "0.24"
-# JSON handling for FFI
+scraper = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# JSON-LD extraction (reusing from our html_parser patterns)
-html5ever = "0.29"
-# Tree-sitter for JS variable extraction
-tree-sitter = "0.25"
-tree-sitter-javascript = "0.25"
-# Regex for fallback parsing
-regex = "1.11"
-# Safe C string handling
-libc = "0.2"
+thiserror = "2.0"
+# Using latest SWC versions for serde compatibility
+swc_ecma_parser = "33"
+swc_ecma_ast = "20"
+swc_common = { version = "18", features = ["sourcemap"] }
+# HTTP client for Rust-side crawling
+reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "brotli", "deflate", "blocking"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+# Simple blocking HTTP client (no tokio dependencies)
+ureq = "3"
+url = "2.5"
+# Robots.txt and sitemap parsing
+texting_robots = "0.2"  # robots.txt parser
+quick-xml = "0.37"      # XML sitemap parser
 
 [profile.release]
 lto = true
 codegen-units = 1
-opt-level = "z"
-strip = true

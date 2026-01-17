@@ -1,40 +1,34 @@
-//! FFI interface for C++ interop
-//!
-//! Provides C-compatible functions for extracting data from HTML.
-//! All strings are passed as JSON for simplicity and type safety.
+//! C FFI interface for the HTML parser
 
+use crate::extractors::{extract_all, ExtractionRequest};
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
+use std::time::Duration;
 
-use crate::extractors::{
-    extract_css, extract_jsonld, extract_js_variables, extract_microdata, extract_opengraph,
-    ExtractionRequest, ExtractionResult,
-};
-
-/// Result struct returned to C++
-/// Both pointers are owned by Rust and must be freed via free_extraction_result
+/// FFI-safe extraction result
 #[repr(C)]
 pub struct ExtractionResultFFI {
-    /// JSON-serialized result (null-terminated)
+    /// JSON-serialized result (caller must free with free_extraction_result)
     pub json_ptr: *mut c_char,
-    /// Error message if extraction failed (null-terminated), or null on success
+    /// Error message if failed (caller must free with free_extraction_result)
     pub error_ptr: *mut c_char,
 }
 
-/// Extract data from HTML according to the request specification.
+/// Extract data from HTML
 ///
 /// # Arguments
-/// * `html_ptr` - Pointer to HTML content (UTF-8, not necessarily null-terminated)
-/// * `html_len` - Length of HTML content in bytes
-/// * `request_json` - JSON-serialized ExtractionRequest (null-terminated)
+/// * `html_ptr` - Pointer to HTML string
+/// * `html_len` - Length of HTML string
+/// * `request_json` - JSON-serialized ExtractionRequest
 ///
 /// # Returns
-/// ExtractionResultFFI with either json_ptr set (success) or error_ptr set (failure)
+/// ExtractionResultFFI with either json_ptr or error_ptr set
 ///
 /// # Safety
-/// - `html_ptr` must point to valid memory of at least `html_len` bytes
-/// - `request_json` must be a valid null-terminated C string
-/// - Caller must free the result via `free_extraction_result`
+/// Caller must:
+/// - Ensure html_ptr points to valid UTF-8 of html_len bytes
+/// - Ensure request_json is a valid null-terminated C string
+/// - Call free_extraction_result on the returned value
 #[no_mangle]
 pub unsafe extern "C" fn extract_from_html(
     html_ptr: *const c_char,
@@ -42,58 +36,58 @@ pub unsafe extern "C" fn extract_from_html(
     request_json: *const c_char,
 ) -> ExtractionResultFFI {
     // Parse HTML
-    let html = if html_ptr.is_null() || html_len == 0 {
-        String::new()
-    } else {
-        let slice = std::slice::from_raw_parts(html_ptr as *const u8, html_len);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                return make_error_result("Invalid UTF-8 in HTML content");
-            }
+    let html = match std::str::from_utf8(std::slice::from_raw_parts(html_ptr as *const u8, html_len))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8 in HTML: {}", e)),
+            };
         }
     };
 
     // Parse request JSON
-    let request_str = if request_json.is_null() {
-        return make_error_result("Request JSON is null");
-    } else {
-        match CStr::from_ptr(request_json).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                return make_error_result("Invalid UTF-8 in request JSON");
-            }
+    let request_str = match CStr::from_ptr(request_json).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8 in request: {}", e)),
+            };
         }
     };
 
     let request: ExtractionRequest = match serde_json::from_str(request_str) {
         Ok(r) => r,
         Err(e) => {
-            return make_error_result(&format!("Failed to parse request JSON: {}", e));
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid request JSON: {}", e)),
+            };
         }
     };
 
     // Perform extraction
-    let result = perform_extraction(&html, &request);
+    let result = extract_all(html, &request);
 
-    // Serialize result to JSON
+    // Serialize result
     match serde_json::to_string(&result) {
-        Ok(json) => match CString::new(json) {
-            Ok(cstr) => ExtractionResultFFI {
-                json_ptr: cstr.into_raw(),
-                error_ptr: ptr::null_mut(),
-            },
-            Err(_) => make_error_result("Result JSON contains null bytes"),
+        Ok(json) => ExtractionResultFFI {
+            json_ptr: string_to_ptr(json),
+            error_ptr: ptr::null_mut(),
         },
-        Err(e) => make_error_result(&format!("Failed to serialize result: {}", e)),
+        Err(e) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr(format!("Failed to serialize result: {}", e)),
+        },
     }
 }
 
-/// Free an ExtractionResultFFI returned by extract_from_html
+/// Free an extraction result
 ///
 /// # Safety
-/// - `result` must have been returned by `extract_from_html`
-/// - Must only be called once per result
+/// Must only be called with a result from extract_from_html
 #[no_mangle]
 pub unsafe extern "C" fn free_extraction_result(result: ExtractionResultFFI) {
     if !result.json_ptr.is_null() {
@@ -104,328 +98,646 @@ pub unsafe extern "C" fn free_extraction_result(result: ExtractionResultFFI) {
     }
 }
 
-/// Extract JSON-LD data from HTML (convenience function)
-///
-/// # Safety
-/// Same as extract_from_html
+/// Convert String to C pointer
+fn string_to_ptr(s: String) -> *mut c_char {
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Get version string
+#[no_mangle]
+pub extern "C" fn rust_parser_version() -> *const c_char {
+    static VERSION: &[u8] = b"0.1.0\0";
+    VERSION.as_ptr() as *const c_char
+}
+
+// Convenience extractors for individual data types
+
+/// Extract JSON-LD from HTML, returns JSON object keyed by @type
 #[no_mangle]
 pub unsafe extern "C" fn extract_jsonld_ffi(
     html_ptr: *const c_char,
     html_len: usize,
 ) -> ExtractionResultFFI {
-    let html = if html_ptr.is_null() || html_len == 0 {
-        String::new()
-    } else {
-        let slice = std::slice::from_raw_parts(html_ptr as *const u8, html_len);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s.to_string(),
-            Err(_) => return make_error_result("Invalid UTF-8 in HTML"),
+    let html = match std::str::from_utf8(std::slice::from_raw_parts(html_ptr as *const u8, html_len)) {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8: {}", e)),
+            };
         }
     };
 
-    let result = extract_jsonld(&html);
-    match serde_json::to_string(&result) {
-        Ok(json) => match CString::new(json) {
-            Ok(cstr) => ExtractionResultFFI {
-                json_ptr: cstr.into_raw(),
-                error_ptr: ptr::null_mut(),
-            },
-            Err(_) => make_error_result("Result contains null bytes"),
+    let document = scraper::Html::parse_document(html);
+    let jsonld = crate::extractors::extract_jsonld_objects(&document);
+
+    match serde_json::to_string(&jsonld) {
+        Ok(json) => ExtractionResultFFI {
+            json_ptr: string_to_ptr(json),
+            error_ptr: ptr::null_mut(),
         },
-        Err(e) => make_error_result(&format!("Serialize error: {}", e)),
+        Err(e) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr(format!("Serialization error: {}", e)),
+        },
     }
 }
 
-/// Extract microdata from HTML (convenience function)
+/// Extract Microdata from HTML
 #[no_mangle]
 pub unsafe extern "C" fn extract_microdata_ffi(
     html_ptr: *const c_char,
     html_len: usize,
 ) -> ExtractionResultFFI {
-    let html = if html_ptr.is_null() || html_len == 0 {
-        String::new()
-    } else {
-        let slice = std::slice::from_raw_parts(html_ptr as *const u8, html_len);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s.to_string(),
-            Err(_) => return make_error_result("Invalid UTF-8 in HTML"),
+    let html = match std::str::from_utf8(std::slice::from_raw_parts(html_ptr as *const u8, html_len)) {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8: {}", e)),
+            };
         }
     };
 
-    let result = extract_microdata(&html);
-    match serde_json::to_string(&result) {
-        Ok(json) => match CString::new(json) {
-            Ok(cstr) => ExtractionResultFFI {
-                json_ptr: cstr.into_raw(),
-                error_ptr: ptr::null_mut(),
-            },
-            Err(_) => make_error_result("Result contains null bytes"),
+    let document = scraper::Html::parse_document(html);
+    let microdata = crate::extractors::extract_microdata(&document);
+
+    match serde_json::to_string(&microdata) {
+        Ok(json) => ExtractionResultFFI {
+            json_ptr: string_to_ptr(json),
+            error_ptr: ptr::null_mut(),
         },
-        Err(e) => make_error_result(&format!("Serialize error: {}", e)),
+        Err(e) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr(format!("Serialization error: {}", e)),
+        },
     }
 }
 
-/// Extract OpenGraph data from HTML (convenience function)
+/// Extract OpenGraph from HTML
 #[no_mangle]
 pub unsafe extern "C" fn extract_opengraph_ffi(
     html_ptr: *const c_char,
     html_len: usize,
 ) -> ExtractionResultFFI {
-    let html = if html_ptr.is_null() || html_len == 0 {
-        String::new()
-    } else {
-        let slice = std::slice::from_raw_parts(html_ptr as *const u8, html_len);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s.to_string(),
-            Err(_) => return make_error_result("Invalid UTF-8 in HTML"),
+    let html = match std::str::from_utf8(std::slice::from_raw_parts(html_ptr as *const u8, html_len)) {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8: {}", e)),
+            };
         }
     };
 
-    let result = extract_opengraph(&html);
-    match serde_json::to_string(&result) {
-        Ok(json) => match CString::new(json) {
-            Ok(cstr) => ExtractionResultFFI {
-                json_ptr: cstr.into_raw(),
-                error_ptr: ptr::null_mut(),
-            },
-            Err(_) => make_error_result("Result contains null bytes"),
+    let document = scraper::Html::parse_document(html);
+    let og = crate::extractors::extract_opengraph(&document);
+
+    match serde_json::to_string(&og) {
+        Ok(json) => ExtractionResultFFI {
+            json_ptr: string_to_ptr(json),
+            error_ptr: ptr::null_mut(),
         },
-        Err(e) => make_error_result(&format!("Serialize error: {}", e)),
+        Err(e) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr(format!("Serialization error: {}", e)),
+        },
     }
 }
 
-/// Extract JavaScript variables from HTML (convenience function)
+/// Extract JS variables from HTML (placeholder - needs tree-sitter)
 #[no_mangle]
 pub unsafe extern "C" fn extract_js_ffi(
-    html_ptr: *const c_char,
-    html_len: usize,
+    _html_ptr: *const c_char,
+    _html_len: usize,
 ) -> ExtractionResultFFI {
-    let html = if html_ptr.is_null() || html_len == 0 {
-        String::new()
-    } else {
-        let slice = std::slice::from_raw_parts(html_ptr as *const u8, html_len);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s.to_string(),
-            Err(_) => return make_error_result("Invalid UTF-8 in HTML"),
-        }
-    };
-
-    let result = extract_js_variables(&html);
-    match serde_json::to_string(&result) {
-        Ok(json) => match CString::new(json) {
-            Ok(cstr) => ExtractionResultFFI {
-                json_ptr: cstr.into_raw(),
-                error_ptr: ptr::null_mut(),
-            },
-            Err(_) => make_error_result("Result contains null bytes"),
-        },
-        Err(e) => make_error_result(&format!("Serialize error: {}", e)),
+    // TODO: Implement JS extraction with tree-sitter
+    ExtractionResultFFI {
+        json_ptr: string_to_ptr("{}".to_string()),
+        error_ptr: ptr::null_mut(),
     }
 }
 
-/// CSS selector extraction
+/// Extract elements matching CSS selector
 #[no_mangle]
 pub unsafe extern "C" fn extract_css_ffi(
     html_ptr: *const c_char,
     html_len: usize,
-    selector: *const c_char,
+    selector_ptr: *const c_char,
 ) -> ExtractionResultFFI {
-    let html = if html_ptr.is_null() || html_len == 0 {
-        String::new()
-    } else {
-        let slice = std::slice::from_raw_parts(html_ptr as *const u8, html_len);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s.to_string(),
-            Err(_) => return make_error_result("Invalid UTF-8 in HTML"),
+    let html = match std::str::from_utf8(std::slice::from_raw_parts(html_ptr as *const u8, html_len)) {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8: {}", e)),
+            };
         }
     };
 
-    let selector_str = if selector.is_null() {
-        return make_error_result("Selector is null");
-    } else {
-        match CStr::from_ptr(selector).to_str() {
-            Ok(s) => s,
-            Err(_) => return make_error_result("Invalid UTF-8 in selector"),
+    let selector_str = match CStr::from_ptr(selector_ptr).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid selector: {}", e)),
+            };
         }
     };
 
-    let result = extract_css(&html, selector_str);
-    match serde_json::to_string(&result) {
-        Ok(json) => match CString::new(json) {
-            Ok(cstr) => ExtractionResultFFI {
-                json_ptr: cstr.into_raw(),
+    let document = scraper::Html::parse_document(html);
+    let selector = match scraper::Selector::parse(selector_str) {
+        Ok(s) => s,
+        Err(_) => {
+            return ExtractionResultFFI {
+                json_ptr: string_to_ptr("[]".to_string()),
                 error_ptr: ptr::null_mut(),
-            },
-            Err(_) => make_error_result("Result contains null bytes"),
+            };
+        }
+    };
+
+    let results: Vec<String> = document
+        .select(&selector)
+        .map(|el| el.text().collect::<String>().trim().to_string())
+        .collect();
+
+    match serde_json::to_string(&results) {
+        Ok(json) => ExtractionResultFFI {
+            json_ptr: string_to_ptr(json),
+            error_ptr: ptr::null_mut(),
         },
-        Err(e) => make_error_result(&format!("Serialize error: {}", e)),
+        Err(e) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr(format!("Serialization error: {}", e)),
+        },
     }
 }
 
-// Helper to create error result
-fn make_error_result(msg: &str) -> ExtractionResultFFI {
-    let error_cstr = CString::new(msg).unwrap_or_else(|_| CString::new("Unknown error").unwrap());
-    ExtractionResultFFI {
-        json_ptr: ptr::null_mut(),
-        error_ptr: error_cstr.into_raw(),
-    }
+// ============================================================================
+// Batch Crawl + Extract (HTTP in Rust)
+// ============================================================================
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Request for batch crawling
+#[derive(Debug, serde::Deserialize)]
+struct BatchCrawlRequest {
+    urls: Vec<String>,
+    #[serde(default)]
+    extraction: Option<ExtractionRequest>,
+    #[serde(default = "default_user_agent")]
+    user_agent: String,
+    #[serde(default = "default_timeout")]
+    timeout_ms: u64,
+    #[serde(default = "default_concurrency")]
+    concurrency: usize,
+    #[serde(default)]
+    delay_ms: u64, // Min delay between requests to same domain
 }
 
-// Perform the actual extraction based on request
-fn perform_extraction(html: &str, request: &ExtractionRequest) -> ExtractionResult {
-    let mut result = ExtractionResult::default();
-
-    for spec in &request.specs {
-        let value = match spec.source.as_str() {
-            "jsonld" => {
-                let data = extract_jsonld(html);
-                extract_path_from_json(&data, &spec.path)
-            }
-            "microdata" => {
-                let data = extract_microdata(html);
-                extract_path_from_json(&data, &spec.path)
-            }
-            "og" | "opengraph" => {
-                let data = extract_opengraph(html);
-                extract_path_from_json(&data, &spec.path)
-            }
-            "js" => {
-                let data = extract_js_variables(html);
-                extract_path_from_json(&data, &spec.path)
-            }
-            "css" => {
-                // Path is the CSS selector, possibly with ::text or ::attr(x) suffix
-                let (selector, extract_mode) = parse_css_selector_with_pseudo(&spec.path);
-                let elements = extract_css(html, &selector);
-                extract_from_css_elements(&elements, &extract_mode)
-            }
-            _ => None,
-        };
-
-        // Apply transform if present
-        let final_value = if let Some(ref transform) = spec.transform {
-            apply_transform(value.as_deref(), transform)
-        } else {
-            value
-        };
-
-        result.values.push(crate::extractors::ExtractedValue {
-            alias: spec.alias.clone(),
-            value: final_value,
-        });
-    }
-
-    result
+fn default_user_agent() -> String {
+    "DuckDB-Crawler/1.0".to_string()
 }
 
-// Extract a value from JSON using dot notation path
-fn extract_path_from_json(json: &serde_json::Value, path: &str) -> Option<String> {
-    if path.is_empty() {
-        return Some(json.to_string());
-    }
-
-    let mut current = json;
-    for segment in path.split('.') {
-        // Handle array index notation: field[0]
-        if let Some(bracket_pos) = segment.find('[') {
-            let field = &segment[..bracket_pos];
-            if !field.is_empty() {
-                current = current.get(field)?;
-            }
-            // Parse index
-            let index_end = segment.find(']')?;
-            let index: usize = segment[bracket_pos + 1..index_end].parse().ok()?;
-            current = current.get(index)?;
-        } else {
-            current = current.get(segment)?;
-        }
-    }
-
-    // Return as string - if it's already a string, unquote it
-    match current {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Null => None,
-        _ => Some(current.to_string()),
-    }
+fn default_timeout() -> u64 {
+    30000
 }
 
-// Parse CSS selector with pseudo-element (::text, ::attr(x))
-fn parse_css_selector_with_pseudo(input: &str) -> (String, CssExtractMode) {
-    if let Some(pos) = input.rfind("::text") {
-        (input[..pos].to_string(), CssExtractMode::Text)
-    } else if let Some(pos) = input.rfind("::attr(") {
-        let attr_start = pos + 7;
-        if let Some(attr_end) = input[attr_start..].find(')') {
-            let attr_name = input[attr_start..attr_start + attr_end].to_string();
-            (input[..pos].to_string(), CssExtractMode::Attr(attr_name))
-        } else {
-            (input.to_string(), CssExtractMode::Html)
-        }
-    } else {
-        (input.to_string(), CssExtractMode::Html)
-    }
+fn default_concurrency() -> usize {
+    4
 }
 
-enum CssExtractMode {
-    Text,
-    Html,
-    Attr(String),
+/// Extract domain from URL
+fn extract_domain(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+        .unwrap_or_default()
 }
 
-fn extract_from_css_elements(elements: &[String], mode: &CssExtractMode) -> Option<String> {
-    if elements.is_empty() {
-        return None;
-    }
+/// Per-domain rate limiter
+type DomainRateLimiter = Arc<Mutex<HashMap<String, std::time::Instant>>>;
 
-    // For now, just return the first element
-    // TODO: Handle multiple matches
-    let html = &elements[0];
-
-    match mode {
-        CssExtractMode::Html => Some(html.clone()),
-        CssExtractMode::Text => {
-            // Simple text extraction - strip HTML tags
-            let re = regex::Regex::new(r"<[^>]+>").ok()?;
-            let text = re.replace_all(html, "").to_string();
-            Some(text.trim().to_string())
-        }
-        CssExtractMode::Attr(attr_name) => {
-            // Extract attribute value
-            let pattern = format!(r#"{}="([^"]*)"#, regex::escape(attr_name));
-            let re = regex::Regex::new(&pattern).ok()?;
-            re.captures(html)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_string())
-        }
-    }
+/// Single crawl result
+#[derive(Debug, serde::Serialize)]
+struct CrawlResult {
+    url: String,
+    status: i32,
+    content_type: String,
+    body: String,
+    error: Option<String>,
+    extracted: Option<serde_json::Value>,
+    response_time_ms: u64,
 }
 
-// Apply transformation to extracted value
-fn apply_transform(value: Option<&str>, transform: &str) -> Option<String> {
-    let v = value?;
+/// Batch crawl response
+#[derive(Debug, serde::Serialize)]
+struct BatchCrawlResponse {
+    results: Vec<CrawlResult>,
+}
 
-    match transform {
-        "trim" => Some(v.trim().to_string()),
-        "parse_price" => {
-            // Extract numeric value from price string like "€12.99" or "12,99 €"
-            let mut result = String::new();
-            let mut has_decimal = false;
-            for c in v.chars() {
-                if c.is_ascii_digit() {
-                    result.push(c);
-                } else if (c == '.' || c == ',') && !has_decimal {
-                    result.push('.');
-                    has_decimal = true;
+/// Fetch a single URL with rate limiting and optional extraction
+async fn fetch_and_extract(
+    client: &reqwest::Client,
+    url: String,
+    extraction: &Option<ExtractionRequest>,
+    rate_limiter: &DomainRateLimiter,
+    delay_ms: u64,
+) -> CrawlResult {
+    let start = std::time::Instant::now();
+
+    // Apply per-domain rate limiting
+    if delay_ms > 0 {
+        let domain = extract_domain(&url);
+        let delay = Duration::from_millis(delay_ms);
+
+        let wait_time = {
+            let limiter = rate_limiter.lock().await;
+            if let Some(last_access) = limiter.get(&domain) {
+                let elapsed = last_access.elapsed();
+                if elapsed < delay {
+                    Some(delay - elapsed)
+                } else {
+                    None
                 }
-            }
-            if result.is_empty() {
-                None
             } else {
-                Some(result)
+                None
+            }
+        };
+
+        if let Some(wait) = wait_time {
+            tokio::time::sleep(wait).await;
+        }
+
+        // Update last access time
+        {
+            let mut limiter = rate_limiter.lock().await;
+            limiter.insert(domain, std::time::Instant::now());
+        }
+    }
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status().as_u16() as i32;
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            match response.text().await {
+                Ok(body) => {
+                    let extracted = if let Some(req) = extraction {
+                        let result = extract_all(&body, req);
+                        // Convert HashMap to JSON Value
+                        serde_json::to_value(&result.values).ok()
+                    } else {
+                        None
+                    };
+
+                    CrawlResult {
+                        url,
+                        status,
+                        content_type,
+                        body,
+                        error: None,
+                        extracted,
+                        response_time_ms: start.elapsed().as_millis() as u64,
+                    }
+                }
+                Err(e) => CrawlResult {
+                    url,
+                    status,
+                    content_type,
+                    body: String::new(),
+                    error: Some(format!("Body read error: {}", e)),
+                    extracted: None,
+                    response_time_ms: start.elapsed().as_millis() as u64,
+                },
             }
         }
-        "lowercase" => Some(v.to_lowercase()),
-        "uppercase" => Some(v.to_uppercase()),
-        _ => Some(v.to_string()),
+        Err(e) => CrawlResult {
+            url,
+            status: 0,
+            content_type: String::new(),
+            body: String::new(),
+            error: Some(e.to_string()),
+            extracted: None,
+            response_time_ms: start.elapsed().as_millis() as u64,
+        },
+    }
+}
+
+/// Batch crawl URLs with optional extraction
+///
+/// # Arguments
+/// * `request_json` - JSON BatchCrawlRequest
+///
+/// # Returns
+/// ExtractionResultFFI with JSON BatchCrawlResponse
+#[no_mangle]
+pub unsafe extern "C" fn crawl_batch_ffi(
+    request_json: *const c_char,
+) -> ExtractionResultFFI {
+    let request_str = match CStr::from_ptr(request_json).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8: {}", e)),
+            };
+        }
+    };
+
+    let request: BatchCrawlRequest = match serde_json::from_str(request_str) {
+        Ok(r) => r,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid request: {}", e)),
+            };
+        }
+    };
+
+    // Build HTTP client
+    let client = match reqwest::Client::builder()
+        .user_agent(&request.user_agent)
+        .timeout(Duration::from_millis(request.timeout_ms))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Client build error: {}", e)),
+            };
+        }
+    };
+
+    // Run async crawl
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Tokio runtime error: {}", e)),
+            };
+        }
+    };
+
+    let results = runtime.block_on(async {
+        use futures::stream::{self, StreamExt};
+
+        let concurrency = request.concurrency.max(1).min(32);
+        let extraction = request.extraction.clone();
+        let delay_ms = request.delay_ms;
+        let rate_limiter: DomainRateLimiter = Arc::new(Mutex::new(HashMap::new()));
+
+        stream::iter(request.urls)
+            .map(|url| {
+                let client = client.clone();
+                let extraction = extraction.clone();
+                let rate_limiter = rate_limiter.clone();
+                async move { fetch_and_extract(&client, url, &extraction, &rate_limiter, delay_ms).await }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await
+    });
+
+    let response = BatchCrawlResponse { results };
+
+    match serde_json::to_string(&response) {
+        Ok(json) => ExtractionResultFFI {
+            json_ptr: string_to_ptr(json),
+            error_ptr: ptr::null_mut(),
+        },
+        Err(e) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr(format!("Serialization error: {}", e)),
+        },
+    }
+}
+
+// ============================================================================
+// Sitemap Fetching
+// ============================================================================
+
+/// Request for sitemap fetching
+#[derive(Debug, serde::Deserialize)]
+struct SitemapRequest {
+    url: String,
+    #[serde(default = "default_true")]
+    recursive: bool,
+    #[serde(default = "default_max_depth")]
+    max_depth: usize,
+    #[serde(default = "default_user_agent")]
+    user_agent: String,
+    #[serde(default = "default_timeout")]
+    timeout_ms: u64,
+    #[serde(default)]
+    discover_from_robots: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_depth() -> usize {
+    5
+}
+
+/// Fetch and parse sitemap(s) - SIMPLE FFI (returns char* directly)
+///
+/// # Arguments
+/// * `request_json` - JSON SitemapRequest
+///
+/// # Returns
+/// JSON string pointer (caller must free with free_rust_string)
+#[no_mangle]
+pub unsafe extern "C" fn fetch_sitemap_simple(request_json: *const c_char) -> *mut c_char {
+    // Wrap in catch_unwind to prevent panics from crashing the process
+    let result = std::panic::catch_unwind(|| fetch_sitemap_simple_inner(request_json));
+
+    match result {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            string_to_ptr("{\"urls\":[],\"sitemaps\":[],\"errors\":[\"Panic in sitemap fetch\"]}".to_string())
+        }
+    }
+}
+
+unsafe fn fetch_sitemap_simple_inner(request_json: *const c_char) -> *mut c_char {
+    let request_str = match CStr::from_ptr(request_json).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            return string_to_ptr(format!("{{\"urls\":[],\"sitemaps\":[],\"errors\":[\"Invalid UTF-8: {}\"]}}", e));
+        }
+    };
+
+    let request: SitemapRequest = match serde_json::from_str(request_str) {
+        Ok(r) => r,
+        Err(e) => {
+            return string_to_ptr(format!("{{\"urls\":[],\"sitemaps\":[],\"errors\":[\"Invalid request: {}\"]}}", e));
+        }
+    };
+
+    let timeout_secs = (request.timeout_ms / 1000).max(1);
+
+    let mut sitemap_urls = vec![request.url.clone()];
+
+    // If discover_from_robots, first check robots.txt for sitemap URLs
+    if request.discover_from_robots {
+        let robots_cache = crate::robots::RobotsCache::new();
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(timeout_secs)))
+                .user_agent(&request.user_agent)
+                .build(),
+        );
+        let sitemaps =
+            robots_cache.get_sitemaps_blocking(&agent, &request.url, &request.user_agent);
+        if !sitemaps.is_empty() {
+            sitemap_urls = sitemaps;
+        }
+    }
+
+    let mut combined = crate::sitemap::SitemapResult {
+        urls: vec![],
+        sitemaps: vec![],
+        errors: vec![],
+    };
+
+    for sitemap_url in sitemap_urls {
+        let result = crate::sitemap::fetch_sitemap_blocking(
+            &sitemap_url,
+            &request.user_agent,
+            timeout_secs,
+            request.recursive,
+            request.max_depth,
+        );
+        combined.urls.extend(result.urls);
+        combined.sitemaps.extend(result.sitemaps);
+        combined.errors.extend(result.errors);
+    }
+
+    match serde_json::to_string(&combined) {
+        Ok(json) => string_to_ptr(json),
+        Err(e) => {
+            string_to_ptr(format!("{{\"urls\":[],\"sitemaps\":[],\"errors\":[\"Serialization error: {}\"]}}", e))
+        }
+    }
+}
+
+/// Free a string allocated by Rust
+#[no_mangle]
+pub unsafe extern "C" fn free_rust_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(CString::from_raw(ptr));
+    }
+}
+
+/// Fetch and parse sitemap(s) - OLD struct-based FFI (deprecated)
+#[no_mangle]
+pub unsafe extern "C" fn fetch_sitemap_ffi(request_json: *const c_char) -> ExtractionResultFFI {
+    // Wrap in catch_unwind to prevent panics from crashing the process
+    let result = std::panic::catch_unwind(|| fetch_sitemap_ffi_inner(request_json));
+
+    match result {
+        Ok(r) => r,
+        Err(_) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr("Panic in sitemap fetch".to_string()),
+        },
+    }
+}
+
+unsafe fn fetch_sitemap_ffi_inner(request_json: *const c_char) -> ExtractionResultFFI {
+    // Use the simple version and wrap result
+    let json_ptr = fetch_sitemap_simple(request_json);
+    ExtractionResultFFI {
+        json_ptr,
+        error_ptr: ptr::null_mut(),
+    }
+}
+
+// ============================================================================
+// Robots.txt Checking
+// ============================================================================
+
+/// Request for robots.txt check
+#[derive(Debug, serde::Deserialize)]
+struct RobotsCheckRequest {
+    url: String,
+    #[serde(default = "default_user_agent")]
+    user_agent: String,
+    #[serde(default = "default_timeout")]
+    timeout_ms: u64,
+}
+
+/// Check if URL is allowed by robots.txt
+#[no_mangle]
+pub unsafe extern "C" fn check_robots_ffi(request_json: *const c_char) -> ExtractionResultFFI {
+    // Wrap in catch_unwind to prevent panics from crashing the process
+    let result = std::panic::catch_unwind(|| check_robots_ffi_inner(request_json));
+
+    match result {
+        Ok(r) => r,
+        Err(_) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr("Panic in robots check".to_string()),
+        },
+    }
+}
+
+unsafe fn check_robots_ffi_inner(request_json: *const c_char) -> ExtractionResultFFI {
+    let request_str = match CStr::from_ptr(request_json).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8: {}", e)),
+            };
+        }
+    };
+
+    let request: RobotsCheckRequest = match serde_json::from_str(request_str) {
+        Ok(r) => r,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid request: {}", e)),
+            };
+        }
+    };
+
+    let timeout_secs = (request.timeout_ms / 1000).max(1);
+
+    // Build ureq agent
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(timeout_secs)))
+            .user_agent(&request.user_agent)
+            .build(),
+    );
+
+    let robots_cache = crate::robots::RobotsCache::new();
+    let result = robots_cache.check_blocking(&agent, &request.url, &request.user_agent);
+
+    match serde_json::to_string(&result) {
+        Ok(json) => ExtractionResultFFI {
+            json_ptr: string_to_ptr(json),
+            error_ptr: ptr::null_mut(),
+        },
+        Err(e) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr(format!("Serialization error: {}", e)),
+        },
     }
 }

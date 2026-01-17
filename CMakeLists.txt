@@ -46,7 +46,7 @@ if(ENABLE_RUST_PARSER)
                 ${RUST_PARSER_DIR}/Cargo.toml
                 ${RUST_PARSER_DIR}/src/lib.rs
                 ${RUST_PARSER_DIR}/src/ffi.rs
-                ${RUST_PARSER_DIR}/src/extractors/mod.rs
+                ${RUST_PARSER_DIR}/src/extractors.rs
         )
 
         # Create imported library target
@@ -101,7 +101,13 @@ include_directories(src/include)
 set(EXTENSION_SOURCES
     src/crawler_extension.cpp
     src/crawler_function.cpp
+    src/crawler_worker.cpp
+    src/crawler_batch.cpp
     src/crawler_utils.cpp
+    src/css_extract_function.cpp
+    src/crawl_stream_function.cpp
+    src/crawl_table_function.cpp
+    src/sitemap_function.cpp
     src/thread_utils.cpp
     src/robots_parser.cpp
     src/http_client.cpp

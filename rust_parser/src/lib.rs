@@ -1,14 +1,17 @@
-//! Rust HTML Parser for DuckDB Crawler Extension
+//! Rust HTML Parser FFI for DuckDB Crawler Extension
 //!
-//! Provides FFI interface for extracting structured data from HTML:
-//! - JSON-LD (with @graph support)
+//! Provides extraction capabilities for:
+//! - JSON-LD structured data
 //! - Microdata (schema.org)
 //! - OpenGraph meta tags
-//! - CSS selectors
-//! - JavaScript variables (via tree-sitter AST parsing)
+//! - Meta tags
+//! - CSS selectors (jQuery-like syntax)
+//! - robots.txt parsing
+//! - Sitemap XML parsing
 
-pub mod extractors;
-pub mod ffi;
+mod extractors;
+mod ffi;
+pub mod robots;
+pub mod sitemap;
 
-pub use extractors::*;
 pub use ffi::*;
