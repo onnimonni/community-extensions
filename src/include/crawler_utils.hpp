@@ -56,6 +56,13 @@ std::string ParseAndValidateServerDate(const std::string &server_date);
 // URL Utilities
 //===--------------------------------------------------------------------===//
 
+// Validate URL for crawling. Returns true if URL is valid.
+// Checks: http/https scheme, non-empty hostname, max length
+bool IsValidCrawlUrl(const std::string &url);
+
+// Get validation error message for URL. Returns empty string if valid.
+std::string GetUrlValidationError(const std::string &url);
+
 // Extract domain from URL (without port)
 std::string ExtractDomain(const std::string &url);
 

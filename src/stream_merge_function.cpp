@@ -494,10 +494,10 @@ static void StreamMergeFunction(ClientContext &context, TableFunctionInput &data
 	string effective_query = bind_data.source_query;
 
 	if (!bind_data.matched_condition.empty() && !bind_data.join_columns.empty()) {
-		// Check if target table exists first
+		// Check if target table exists first (use parameterized query to avoid injection)
 		auto table_check = conn.Query(
-			"SELECT 1 FROM information_schema.tables WHERE table_name = '" +
-			bind_data.target_table + "' LIMIT 1");
+			"SELECT 1 FROM information_schema.tables WHERE table_name = $1 LIMIT 1",
+			bind_data.target_table);
 		auto table_exists = table_check->Fetch();
 
 		if (table_exists && table_exists->size() > 0) {

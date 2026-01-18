@@ -1,7 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "crawler_extension.hpp"
-#include "crawler_function.hpp"
 #include "crawl_parser.hpp"
 #include "css_extract_function.hpp"
 #include "crawl_stream_function.hpp"

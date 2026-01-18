@@ -197,6 +197,68 @@ std::string ParseAndValidateServerDate(const std::string &server_date) {
 // URL Utilities
 //===--------------------------------------------------------------------===//
 
+// Maximum URL length (8KB is generous for any URL)
+static const size_t MAX_URL_LENGTH = 8192;
+
+std::string GetUrlValidationError(const std::string &url) {
+	if (url.empty()) {
+		return "URL is empty";
+	}
+
+	if (url.length() > MAX_URL_LENGTH) {
+		return "URL exceeds maximum length of " + std::to_string(MAX_URL_LENGTH);
+	}
+
+	// Check for http:// or https:// scheme
+	std::string lower_url = url;
+	std::transform(lower_url.begin(), lower_url.end(), lower_url.begin(), ::tolower);
+
+	bool has_http = (lower_url.find("http://") == 0);
+	bool has_https = (lower_url.find("https://") == 0);
+
+	if (!has_http && !has_https) {
+		return "URL must start with http:// or https://";
+	}
+
+	// Extract hostname
+	size_t scheme_end = has_https ? 8 : 7;  // strlen("https://") or strlen("http://")
+	size_t host_end = url.find('/', scheme_end);
+	if (host_end == std::string::npos) {
+		host_end = url.find('?', scheme_end);
+	}
+	if (host_end == std::string::npos) {
+		host_end = url.length();
+	}
+
+	std::string host = url.substr(scheme_end, host_end - scheme_end);
+
+	// Remove port if present
+	size_t port_pos = host.rfind(':');
+	if (port_pos != std::string::npos) {
+		// Make sure it's not an IPv6 address
+		if (host.find('[') == std::string::npos) {
+			host = host.substr(0, port_pos);
+		}
+	}
+
+	if (host.empty()) {
+		return "URL has no hostname";
+	}
+
+	// Check for control characters or spaces in hostname
+	for (char c : host) {
+		if (c <= 32 || c == 127) {
+			return "URL hostname contains invalid character";
+		}
+	}
+
+	return "";  // Valid
+}
+
+bool IsValidCrawlUrl(const std::string &url) {
+	return GetUrlValidationError(url).empty();
+}
+
 std::string ExtractDomain(const std::string &url) {
 	size_t proto_end = url.find("://");
 	if (proto_end == std::string::npos) {

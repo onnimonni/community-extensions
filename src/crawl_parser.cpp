@@ -1,5 +1,4 @@
 #include "crawl_parser.hpp"
-#include "crawler_function.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"

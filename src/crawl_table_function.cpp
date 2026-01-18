@@ -539,31 +539,45 @@ static void EnsureCacheTable(Connection &conn) {
 }
 
 // Get cached entries for URLs that are fresher than ttl_hours
+// Uses batch query to avoid N+1 problem
 static vector<CrawlResultEntry> GetCachedEntries(Connection &conn, const vector<string> &urls, int ttl_hours) {
     vector<CrawlResultEntry> cached;
     if (urls.empty()) return cached;
 
     EnsureCacheTable(conn);
 
-    for (const auto &url : urls) {
-        auto result = conn.Query(
-            "SELECT url, status_code, content_type, body, error, response_time_ms "
-            "FROM " + string(CACHE_TABLE_NAME) + " "
-            "WHERE url = $1 AND cached_at > current_timestamp - INTERVAL '" + std::to_string(ttl_hours) + " hours'",
-            url);
+    // Build IN clause with properly quoted URLs
+    string url_list;
+    for (size_t i = 0; i < urls.size(); i++) {
+        if (i > 0) url_list += ", ";
+        url_list += EscapeSqlString(urls[i]);
+    }
 
-        if (!result->HasError()) {
-            auto chunk = result->Fetch();
-            if (chunk && chunk->size() > 0) {
-                CrawlResultEntry entry;
-                entry.url = chunk->GetValue(0, 0).ToString();
-                entry.status_code = chunk->GetValue(1, 0).GetValue<int>();
-                entry.content_type = chunk->GetValue(2, 0).IsNull() ? "" : chunk->GetValue(2, 0).ToString();
-                entry.body = chunk->GetValue(3, 0).IsNull() ? "" : chunk->GetValue(3, 0).ToString();
-                entry.error = chunk->GetValue(4, 0).IsNull() ? "" : chunk->GetValue(4, 0).ToString();
-                entry.response_time_ms = chunk->GetValue(5, 0).IsNull() ? 0 : chunk->GetValue(5, 0).GetValue<int64_t>();
-                cached.push_back(std::move(entry));
-            }
+    // Single batch query instead of N queries
+    string sql = "SELECT url, status_code, content_type, body, error, response_time_ms "
+                 "FROM " + string(CACHE_TABLE_NAME) + " "
+                 "WHERE url IN (" + url_list + ") "
+                 "AND cached_at > current_timestamp - INTERVAL '" + std::to_string(ttl_hours) + " hours'";
+
+    auto result = conn.Query(sql);
+    if (result->HasError()) {
+        return cached;
+    }
+
+    // Process all results from single query
+    while (true) {
+        auto chunk = result->Fetch();
+        if (!chunk || chunk->size() == 0) break;
+
+        for (idx_t row = 0; row < chunk->size(); row++) {
+            CrawlResultEntry entry;
+            entry.url = chunk->GetValue(0, row).ToString();
+            entry.status_code = chunk->GetValue(1, row).GetValue<int>();
+            entry.content_type = chunk->GetValue(2, row).IsNull() ? "" : chunk->GetValue(2, row).ToString();
+            entry.body = chunk->GetValue(3, row).IsNull() ? "" : chunk->GetValue(3, row).ToString();
+            entry.error = chunk->GetValue(4, row).IsNull() ? "" : chunk->GetValue(4, row).ToString();
+            entry.response_time_ms = chunk->GetValue(5, row).IsNull() ? 0 : chunk->GetValue(5, row).GetValue<int64_t>();
+            cached.push_back(std::move(entry));
         }
     }
     return cached;

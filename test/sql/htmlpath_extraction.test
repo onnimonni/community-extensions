@@ -61,11 +61,11 @@ SELECT htmlpath('<article><header><h1>Title</h1></header></article>', 'article h
 ----
 "Title"
 
-# Test extracting HTML content
+# Test extracting HTML content (inner HTML of selected element)
 query I
 SELECT jq('<div><span>Text</span></div>', 'div').html;
 ----
-<div><span>Text</span></div>
+<span>Text</span>
 
 # Test attribute map
 query I

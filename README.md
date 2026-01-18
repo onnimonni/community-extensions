@@ -178,6 +178,254 @@ WITH (max_crawl_pages 10);
 SELECT url, status_code, length(body) as size FROM pages;
 ```
 
+## Table Functions
+
+### crawl_url() - LATERAL Join Support
+
+Use `crawl_url()` for row-by-row crawling with LATERAL joins:
+
+```sql
+-- Crawl URLs from a table
+SELECT
+    seed.category,
+    c.url,
+    c.status_code,
+    c.html.readability.title
+FROM seed_urls seed,
+LATERAL crawl_url(seed.url) AS c
+WHERE c.status_code = 200;
+
+-- Chain with extraction
+SELECT
+    c.final_url,
+    jq(c.body, 'h1').text as title,
+    c.html.schema['Product'] as product_data
+FROM urls_to_check u,
+LATERAL crawl_url(u.link) AS c;
+```
+
+### sitemap() - Sitemap Parsing
+
+Parse XML sitemaps (supports gzip, recursive sitemap indexes):
+
+```sql
+-- Get all URLs from sitemap
+SELECT * FROM sitemap('https://example.com/sitemap.xml');
+
+-- Recursive sitemap discovery
+SELECT url, lastmod, priority
+FROM sitemap('https://example.com/sitemap_index.xml', recursive := true);
+```
+
+## Extraction Functions
+
+### jq() - CSS Selector Extraction
+
+Extract data using CSS selectors. Returns a STRUCT with text, html, and attr fields:
+
+```sql
+-- Basic usage: returns STRUCT(text, html, attr MAP)
+SELECT jq('<div class="price">$19.99</div>', 'div.price').text;
+-- Result: '$19.99'
+
+-- Get inner HTML
+SELECT jq('<div><span>Hello</span></div>', 'div').html;
+-- Result: '<span>Hello</span>'
+
+-- Get attribute
+SELECT jq('<a href="/link" title="Click">Text</a>', 'a').attr['href'];
+-- Result: '/link'
+
+-- 3-argument form: get specific attribute directly
+SELECT jq('<img src="pic.jpg" alt="Photo">', 'img', 'src');
+-- Result: 'pic.jpg'
+```
+
+### htmlpath() - JSON Path + CSS Extraction
+
+Combine CSS selectors with JSON-like path syntax:
+
+```sql
+-- Extract text content (use @text suffix)
+SELECT htmlpath('<h1>Title</h1>', 'h1@text');
+-- Result: "Title"
+
+-- Extract attribute (use @attr_name suffix)
+SELECT htmlpath('<a href="/page">Link</a>', 'a@href');
+-- Result: "/page"
+
+-- Extract from JSON-LD
+SELECT htmlpath(body, 'script[type="application/ld+json"]@text.Product.name')
+FROM pages WHERE status_code = 200;
+
+-- Extract multiple elements (returns JSON array)
+SELECT htmlpath(body, 'a.product@href[*]') FROM pages;
+```
+
+## HTML Structured Data
+
+Crawl results include pre-extracted structured data:
+
+### html.readability - Article Extraction
+
+Mozilla Readability-style content extraction:
+
+```sql
+SELECT
+    url,
+    html.readability.title,        -- Extracted article title
+    html.readability.excerpt,      -- Short summary
+    html.readability.text_content, -- Plain text content
+    html.readability.content       -- Cleaned HTML content
+FROM crawl(['https://example.com/article']);
+```
+
+### html.schema - Schema.org Data
+
+JSON-LD and Microdata as MAP(VARCHAR, JSON):
+
+```sql
+SELECT
+    url,
+    html.schema['Product'] as product,        -- Product schema
+    html.schema['Organization'] as org,       -- Organization schema
+    html.schema['BreadcrumbList'] as breadcrumbs
+FROM crawl(['https://example.com/product/123']);
+
+-- Access nested fields
+SELECT
+    html.schema['Product']->>'name' as name,
+    html.schema['Product']->'offers'->>'price' as price
+FROM crawl(['https://shop.example.com/item']);
+```
+
+## CRAWLING MERGE INTO
+
+Upsert crawl results with MERGE semantics. Supports conditional updates and handling of stale rows:
+
+```sql
+-- Basic upsert: update existing, insert new
+CRAWLING MERGE INTO products
+USING (
+    SELECT * FROM crawl(['https://shop.example.com/products'])
+) AS src
+ON (src.url = products.url)
+WHEN MATCHED THEN UPDATE BY NAME
+WHEN NOT MATCHED THEN INSERT BY NAME;
+
+-- Conditional update: only update stale rows (>24 hours old)
+CRAWLING MERGE INTO jobs
+USING (
+    SELECT
+        c.final_url as url,
+        jq(c.body, 'h1.title').text as title,
+        current_timestamp as crawled_at
+    FROM crawl(['https://jobs.example.com/listings']) AS listing,
+    LATERAL unnest(cast(htmlpath(listing.body, 'a.job@href[*]') as VARCHAR[])) AS t(job_url),
+    LATERAL crawl_url(job_url) AS c
+    WHERE c.status_code = 200
+) AS src
+ON (src.url = jobs.url)
+WHEN MATCHED AND age(jobs.crawled_at) > INTERVAL '24 hours' THEN UPDATE BY NAME
+WHEN NOT MATCHED THEN INSERT BY NAME
+LIMIT 100;
+
+-- Handle rows no longer in source (soft delete)
+CRAWLING MERGE INTO listings
+USING (SELECT * FROM crawl([...]) WHERE status = 200) AS src
+ON (src.url = listings.url)
+WHEN MATCHED THEN UPDATE BY NAME
+WHEN NOT MATCHED THEN INSERT BY NAME
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET is_deleted = true;
+
+-- Hard delete rows not in source
+CRAWLING MERGE INTO listings
+USING (...) AS src
+ON (src.url = listings.url)
+WHEN MATCHED THEN UPDATE BY NAME
+WHEN NOT MATCHED BY SOURCE AND is_archived = false THEN DELETE;
+```
+
+### MERGE Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `WHEN MATCHED THEN UPDATE BY NAME` | Update existing rows, match columns by name |
+| `WHEN MATCHED THEN DELETE` | Delete matched rows |
+| `WHEN MATCHED AND <condition>` | Conditional match (e.g., stale check) |
+| `WHEN NOT MATCHED THEN INSERT BY NAME` | Insert new rows |
+| `WHEN NOT MATCHED BY SOURCE THEN UPDATE SET ...` | Soft-delete rows no longer in source |
+| `WHEN NOT MATCHED BY SOURCE THEN DELETE` | Hard-delete rows no longer in source |
+| `WHEN NOT MATCHED BY SOURCE AND <condition>` | Conditional handling of missing rows |
+
+## Global Settings
+
+Configure crawler defaults with `SET` statements:
+
+```sql
+-- Set default user agent
+SET crawler_user_agent = 'MyBot/1.0 (+https://example.com/bot)';
+
+-- Set default delay between requests (seconds)
+SET crawler_default_delay = 1.0;
+
+-- Respect robots.txt (default: true)
+SET crawler_respect_robots = true;
+
+-- Request timeout (milliseconds)
+SET crawler_timeout_ms = 30000;
+
+-- Maximum response size (bytes)
+SET crawler_max_response_bytes = 10485760;  -- 10MB
+```
+
+### Available Settings
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `crawler_user_agent` | VARCHAR | required | HTTP User-Agent header |
+| `crawler_default_delay` | DOUBLE | 1.0 | Delay between requests (seconds) |
+| `crawler_respect_robots` | BOOLEAN | true | Honor robots.txt |
+| `crawler_timeout_ms` | INTEGER | 30000 | Request timeout |
+| `crawler_max_response_bytes` | INTEGER | 10485760 | Max response size |
+
+## Proxy Support
+
+### Via DuckDB HTTP Settings
+
+```sql
+-- Set proxy via DuckDB's built-in settings
+SET http_proxy = 'http://proxy.example.com:8080';
+SET http_proxy_username = 'user';
+SET http_proxy_password = 'pass';
+```
+
+### Via CREATE SECRET
+
+```sql
+-- Create secret for API authentication
+CREATE SECRET my_api (
+    TYPE HTTP,
+    EXTRA_HTTP_HEADERS MAP {
+        'Authorization': 'Bearer sk-xxxx',
+        'X-Custom-Header': 'value'
+    }
+);
+
+-- Crawler automatically uses secrets matching URL patterns
+```
+
+## Example SQL Files
+
+See the `examples/` directory for complete working examples:
+
+| File | Description |
+|------|-------------|
+| `examples/crawl_job_listings.sql` | Job board scraping with schema.org |
+| `examples/crawl_products.sql` | E-commerce price monitoring |
+| `examples/crawl_blog_posts.sql` | Blog article extraction with readability |
+| `examples/crawl_events.sql` | Event page crawling with Event schema |
+
 ## CRAWL Statement Syntax
 
 ```sql
@@ -630,9 +878,8 @@ Typical throughput: **50-200 pages/second** depending on:
 ## Limitations
 
 - JavaScript rendering not supported (static HTML only)
-- Maximum response size: 10MB default
+- Maximum response size: 10MB default (configurable)
 - Cookies not persisted across requests
-- No proxy support (yet)
 - Single database connection
 
 ## Dependencies
