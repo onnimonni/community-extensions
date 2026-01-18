@@ -906,21 +906,167 @@ static void CrawlFunction(ClientContext &context, TableFunctionInput &data, Data
 }
 
 //===--------------------------------------------------------------------===//
+// LATERAL Join Support (In-Out Function)
+//===--------------------------------------------------------------------===//
+
+struct CrawlLateralLocalState : public LocalTableFunctionState {
+    // No state needed - each row is independent
+};
+
+static unique_ptr<LocalTableFunctionState> CrawlLateralInitLocal(ExecutionContext &context,
+                                                                   TableFunctionInitInput &input,
+                                                                   GlobalTableFunctionState *global_state) {
+    return make_uniq<CrawlLateralLocalState>();
+}
+
+static OperatorResultType CrawlInOut(ExecutionContext &context, TableFunctionInput &data,
+                                      DataChunk &input, DataChunk &output) {
+    auto &bind_data = data.bind_data->CastNoConst<CrawlBindData>();
+
+    if (input.size() == 0) {
+        return OperatorResultType::NEED_MORE_INPUT;
+    }
+
+    idx_t count = 0;
+
+    for (idx_t i = 0; i < input.size() && count < STANDARD_VECTOR_SIZE; i++) {
+        Value url_val = input.GetValue(0, i);
+
+        if (url_val.IsNull()) {
+            output.SetValue(0, count, Value());
+            output.SetValue(1, count, Value());
+            output.SetValue(2, count, Value());
+            output.SetValue(3, count, BuildHtmlStructValue("", ""));
+            output.SetValue(4, count, Value("NULL URL"));
+            output.SetValue(5, count, Value());
+            output.SetValue(6, count, Value());
+            count++;
+            continue;
+        }
+
+        string url = StringValue::Get(url_val);
+        if (url.empty()) continue;
+
+        // Build minimal batch request for single URL
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+
+        yyjson_mut_val *urls_arr = yyjson_mut_arr(doc);
+        yyjson_mut_arr_add_strcpy(doc, urls_arr, url.c_str());
+        yyjson_mut_obj_add_val(doc, root, "urls", urls_arr);
+
+        if (!bind_data.extraction_request_json.empty() && bind_data.extraction_request_json != "{}") {
+            yyjson_doc *ext_doc = yyjson_read(bind_data.extraction_request_json.c_str(),
+                                               bind_data.extraction_request_json.size(), 0);
+            if (ext_doc) {
+                yyjson_val *ext_root = yyjson_doc_get_root(ext_doc);
+                yyjson_mut_val *ext_copy = yyjson_val_mut_copy(doc, ext_root);
+                yyjson_mut_obj_add_val(doc, root, "extraction", ext_copy);
+                yyjson_doc_free(ext_doc);
+            }
+        }
+
+        yyjson_mut_obj_add_strcpy(doc, root, "user_agent", bind_data.user_agent.c_str());
+        yyjson_mut_obj_add_uint(doc, root, "timeout_ms", bind_data.timeout_ms);
+        yyjson_mut_obj_add_uint(doc, root, "concurrency", 1);
+
+        size_t len = 0;
+        char *json_str = yyjson_mut_write(doc, 0, &len);
+        yyjson_mut_doc_free(doc);
+
+        if (!json_str) {
+            output.SetValue(0, count, Value(url));
+            output.SetValue(1, count, Value());
+            output.SetValue(2, count, Value());
+            output.SetValue(3, count, BuildHtmlStructValue("", ""));
+            output.SetValue(4, count, Value("Failed to serialize request"));
+            output.SetValue(5, count, Value());
+            output.SetValue(6, count, Value());
+            count++;
+            continue;
+        }
+
+        string request_json(json_str, len);
+        free(json_str);
+
+        string response_json = CrawlBatchWithRust(request_json);
+
+        // Parse response
+        yyjson_doc *resp_doc = yyjson_read(response_json.c_str(), response_json.size(), 0);
+        if (!resp_doc) {
+            output.SetValue(0, count, Value(url));
+            output.SetValue(1, count, Value());
+            output.SetValue(2, count, Value());
+            output.SetValue(3, count, BuildHtmlStructValue("", ""));
+            output.SetValue(4, count, Value("Failed to parse response"));
+            output.SetValue(5, count, Value());
+            output.SetValue(6, count, Value());
+            count++;
+            continue;
+        }
+
+        yyjson_val *resp_root = yyjson_doc_get_root(resp_doc);
+        yyjson_val *results_arr = yyjson_obj_get(resp_root, "results");
+
+        if (results_arr && yyjson_is_arr(results_arr) && yyjson_arr_size(results_arr) > 0) {
+            yyjson_val *item = yyjson_arr_get_first(results_arr);
+
+            yyjson_val *url_val_json = yyjson_obj_get(item, "url");
+            yyjson_val *status_val = yyjson_obj_get(item, "status");
+            yyjson_val *content_type_val = yyjson_obj_get(item, "content_type");
+            yyjson_val *body_val = yyjson_obj_get(item, "body");
+            yyjson_val *error_val = yyjson_obj_get(item, "error");
+            yyjson_val *extracted_val = yyjson_obj_get(item, "extracted");
+            yyjson_val *time_val = yyjson_obj_get(item, "response_time_ms");
+
+            string result_url = url_val_json ? yyjson_get_str(url_val_json) : url;
+            int status = status_val ? yyjson_get_int(status_val) : 0;
+            string content_type = content_type_val ? yyjson_get_str(content_type_val) : "";
+            string body = body_val ? yyjson_get_str(body_val) : "";
+            string error = error_val ? yyjson_get_str(error_val) : "";
+            int64_t response_time = time_val ? yyjson_get_int(time_val) : 0;
+
+            string extracted_json;
+            if (extracted_val) {
+                char *ext_str = yyjson_val_write(extracted_val, 0, nullptr);
+                if (ext_str) {
+                    extracted_json = ext_str;
+                    free(ext_str);
+                }
+            }
+
+            output.SetValue(0, count, Value(result_url));
+            output.SetValue(1, count, Value(status));
+            output.SetValue(2, count, Value(content_type));
+            output.SetValue(3, count, BuildHtmlStructValue(body, content_type));
+            output.SetValue(4, count, error.empty() ? Value() : Value(error));
+            output.SetValue(5, count, extracted_json.empty() ? Value() : Value(extracted_json));
+            output.SetValue(6, count, Value::BIGINT(response_time));
+        } else {
+            output.SetValue(0, count, Value(url));
+            output.SetValue(1, count, Value());
+            output.SetValue(2, count, Value());
+            output.SetValue(3, count, BuildHtmlStructValue("", ""));
+            output.SetValue(4, count, Value("No results"));
+            output.SetValue(5, count, Value());
+            output.SetValue(6, count, Value());
+        }
+
+        yyjson_doc_free(resp_doc);
+        count++;
+    }
+
+    output.SetCardinality(count);
+    return OperatorResultType::NEED_MORE_INPUT;
+}
+
+//===--------------------------------------------------------------------===//
 // Register Function
 //===--------------------------------------------------------------------===//
 
 void RegisterCrawlTableFunction(ExtensionLoader &loader) {
-    // Version with URL list
-    TableFunction list_func("crawl",
-                            {LogicalType::LIST(LogicalType::VARCHAR)},
-                            CrawlFunction, CrawlBind, CrawlInitGlobal);
-
-    // Version with query string
-    TableFunction query_func("crawl",
-                             {LogicalType::VARCHAR},
-                             CrawlFunction, CrawlBind, CrawlInitGlobal);
-
-    // Named parameters
+    // Named parameters helper
     auto add_params = [](TableFunction &func) {
         func.named_parameters["extract"] = LogicalType::LIST(LogicalType::VARCHAR);
         func.named_parameters["state_table"] = LogicalType::VARCHAR;
@@ -928,21 +1074,29 @@ void RegisterCrawlTableFunction(ExtensionLoader &loader) {
         func.named_parameters["timeout"] = LogicalType::INTEGER;
         func.named_parameters["workers"] = LogicalType::INTEGER;
         func.named_parameters["batch_size"] = LogicalType::INTEGER;
-        func.named_parameters["delay"] = LogicalType::INTEGER;  // Per-domain delay in ms
-        func.named_parameters["respect_robots"] = LogicalType::BOOLEAN;  // Check robots.txt
-        func.named_parameters["follow"] = LogicalType::VARCHAR;  // CSS selector for links to follow
-        func.named_parameters["max_depth"] = LogicalType::INTEGER;  // Max crawl depth
-        func.named_parameters["cache"] = LogicalType::BOOLEAN;  // Enable HTTP response caching (default true)
-        func.named_parameters["cache_ttl"] = LogicalType::INTEGER;  // Cache TTL in hours (default 24)
+        func.named_parameters["delay"] = LogicalType::INTEGER;
+        func.named_parameters["respect_robots"] = LogicalType::BOOLEAN;
+        func.named_parameters["follow"] = LogicalType::VARCHAR;
+        func.named_parameters["max_depth"] = LogicalType::INTEGER;
+        func.named_parameters["cache"] = LogicalType::BOOLEAN;
+        func.named_parameters["cache_ttl"] = LogicalType::INTEGER;
     };
 
+    // crawl() with URL list (batch mode)
+    TableFunction list_func("crawl",
+                            {LogicalType::LIST(LogicalType::VARCHAR)},
+                            CrawlFunction, CrawlBind, CrawlInitGlobal);
     add_params(list_func);
-    add_params(query_func);
+
+    // crawl() with single URL (also batch mode, no LATERAL)
+    TableFunction single_func("crawl",
+                              {LogicalType::VARCHAR},
+                              CrawlFunction, CrawlBind, CrawlInitGlobal);
+    add_params(single_func);
 
     TableFunctionSet crawl_set("crawl");
     crawl_set.AddFunction(list_func);
-    crawl_set.AddFunction(query_func);
-
+    crawl_set.AddFunction(single_func);
     loader.RegisterFunction(crawl_set);
 }
 
