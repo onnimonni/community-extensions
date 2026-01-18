@@ -43,7 +43,11 @@ static string BuildBatchCrawlRequest(const vector<string> &urls,
                                       int timeout_ms,
                                       int concurrency,
                                       int delay_ms,
-                                      bool respect_robots) {
+                                      bool respect_robots,
+                                      const string &http_proxy = "",
+                                      const string &http_proxy_username = "",
+                                      const string &http_proxy_password = "",
+                                      const std::map<string, string> &extra_headers = {}) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
     if (!doc) return "{}";
 
@@ -74,6 +78,26 @@ static string BuildBatchCrawlRequest(const vector<string> &urls,
     yyjson_mut_obj_add_uint(doc, root, "concurrency", concurrency);
     yyjson_mut_obj_add_uint(doc, root, "delay_ms", delay_ms);
     yyjson_mut_obj_add_bool(doc, root, "respect_robots", respect_robots);
+
+    // Proxy settings (from DuckDB http_proxy)
+    if (!http_proxy.empty()) {
+        yyjson_mut_obj_add_strcpy(doc, root, "http_proxy", http_proxy.c_str());
+        if (!http_proxy_username.empty()) {
+            yyjson_mut_obj_add_strcpy(doc, root, "http_proxy_username", http_proxy_username.c_str());
+        }
+        if (!http_proxy_password.empty()) {
+            yyjson_mut_obj_add_strcpy(doc, root, "http_proxy_password", http_proxy_password.c_str());
+        }
+    }
+
+    // Extra headers (from CREATE SECRET)
+    if (!extra_headers.empty()) {
+        yyjson_mut_val *headers_obj = yyjson_mut_obj(doc);
+        for (const auto &kv : extra_headers) {
+            yyjson_mut_obj_add_strcpy(doc, headers_obj, kv.first.c_str(), kv.second.c_str());
+        }
+        yyjson_mut_obj_add_val(doc, root, "extra_headers", headers_obj);
+    }
 
     size_t len = 0;
     char *json_str = yyjson_mut_write(doc, 0, &len);
@@ -368,6 +392,11 @@ struct CrawlBindData : public TableFunctionData {
     int cache_ttl_hours = 24;  // Cache TTL in hours
     int64_t max_results = -1;  // Max results to return (-1 = unlimited), for LIMIT pushdown
     idx_t reported_cardinality = 0;  // Cardinality we report to optimizer (for LIMIT detection)
+    // Proxy settings (from DuckDB http_proxy or CREATE SECRET)
+    string http_proxy;
+    string http_proxy_username;
+    string http_proxy_password;
+    std::map<string, string> extra_headers;  // From CREATE SECRET extra_http_headers
 };
 
 // URL with depth tracking for link following
@@ -525,6 +554,17 @@ static unique_ptr<FunctionData> CrawlBind(ClientContext &context, TableFunctionB
     }
     if (context.TryGetCurrentSetting("crawler_respect_robots", setting_value)) {
         bind_data->respect_robots = setting_value.GetValue<bool>();
+    }
+
+    // Read DuckDB's http_proxy settings
+    if (context.TryGetCurrentSetting("http_proxy", setting_value) && !setting_value.IsNull()) {
+        bind_data->http_proxy = setting_value.ToString();
+    }
+    if (context.TryGetCurrentSetting("http_proxy_username", setting_value) && !setting_value.IsNull()) {
+        bind_data->http_proxy_username = setting_value.ToString();
+    }
+    if (context.TryGetCurrentSetting("http_proxy_password", setting_value) && !setting_value.IsNull()) {
+        bind_data->http_proxy_password = setting_value.ToString();
     }
 
     // First argument: URL list or single URL string
@@ -791,7 +831,11 @@ static void CrawlFunction(ClientContext &context, TableFunctionInput &data, Data
                 bind_data.timeout_ms,
                 1,  // Single URL, single concurrency
                 bind_data.delay_ms,
-                bind_data.respect_robots
+                bind_data.respect_robots,
+                bind_data.http_proxy,
+                bind_data.http_proxy_username,
+                bind_data.http_proxy_password,
+                bind_data.extra_headers
             );
 
             string response_json = CrawlBatchWithRust(request_json);

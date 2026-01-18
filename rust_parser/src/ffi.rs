@@ -528,6 +528,14 @@ struct BatchCrawlRequest {
     delay_ms: u64, // Min delay between requests to same domain
     #[serde(default)]
     respect_robots: bool, // Check robots.txt before fetching
+    #[serde(default)]
+    http_proxy: Option<String>, // HTTP proxy URL (e.g., "http://proxy:8080")
+    #[serde(default)]
+    http_proxy_username: Option<String>,
+    #[serde(default)]
+    http_proxy_password: Option<String>,
+    #[serde(default)]
+    extra_headers: Option<std::collections::HashMap<String, String>>, // Extra HTTP headers
 }
 
 fn default_user_agent() -> String {
@@ -695,12 +703,37 @@ pub unsafe extern "C" fn crawl_batch_ffi(
         }
     };
 
-    // Build HTTP client
-    let client = match reqwest::Client::builder()
+    // Build HTTP client with optional proxy
+    let mut client_builder = reqwest::Client::builder()
         .user_agent(&request.user_agent)
-        .timeout(Duration::from_millis(request.timeout_ms))
-        .build()
-    {
+        .timeout(Duration::from_millis(request.timeout_ms));
+
+    // Configure proxy if provided
+    if let Some(ref proxy_url) = request.http_proxy {
+        if let Ok(mut proxy) = reqwest::Proxy::all(proxy_url) {
+            // Add basic auth if credentials provided
+            if let (Some(ref user), Some(ref pass)) = (&request.http_proxy_username, &request.http_proxy_password) {
+                proxy = proxy.basic_auth(user, pass);
+            }
+            client_builder = client_builder.proxy(proxy);
+        }
+    }
+
+    // Add extra headers if provided
+    if let Some(ref headers) = request.extra_headers {
+        let mut header_map = reqwest::header::HeaderMap::new();
+        for (key, value) in headers {
+            if let (Ok(name), Ok(val)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                header_map.insert(name, val);
+            }
+        }
+        client_builder = client_builder.default_headers(header_map);
+    }
+
+    let client = match client_builder.build() {
         Ok(c) => c,
         Err(e) => {
             return ExtractionResultFFI {
