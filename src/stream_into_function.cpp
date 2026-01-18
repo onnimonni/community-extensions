@@ -12,6 +12,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "crawler_utils.hpp"
+#include "pipeline_state.hpp"
 
 namespace duckdb {
 
@@ -23,6 +24,7 @@ struct StreamIntoBindData : public TableFunctionData {
     string source_query;
     string target_table;
     int64_t batch_size = 100;
+    int64_t row_limit = 0;  // 0 = unlimited
 };
 
 //===--------------------------------------------------------------------===//
@@ -45,10 +47,11 @@ static unique_ptr<FunctionData> StreamIntoBind(ClientContext &context, TableFunc
                                                 vector<LogicalType> &return_types, vector<string> &names) {
     auto bind_data = make_uniq<StreamIntoBindData>();
 
-    // Parameters from parser: source_query, target_table, batch_size
+    // Parameters from parser: source_query, target_table, batch_size, row_limit
     bind_data->source_query = StringValue::Get(input.inputs[0]);
     bind_data->target_table = StringValue::Get(input.inputs[1]);
     bind_data->batch_size = input.inputs[2].GetValue<int64_t>();
+    bind_data->row_limit = input.inputs[3].GetValue<int64_t>();
 
     // Return single column: rows_inserted
     return_types.push_back(LogicalType::BIGINT);
@@ -84,6 +87,12 @@ static void StreamIntoFunction(ClientContext &context, TableFunctionInput &data,
     // Load the crawler extension in the new connection (required for crawl functions)
     conn.Query("LOAD crawler");
 
+    // Initialize pipeline state for LIMIT pushdown to crawl functions
+    // This allows crawl_url in LATERAL to respect the LIMIT
+    if (bind_data.row_limit > 0) {
+        InitPipelineLimit(*context.db, bind_data.row_limit);
+    }
+
     // Execute source query
     auto query_result = conn.Query(bind_data.source_query);
     if (query_result->HasError()) {
@@ -114,8 +123,14 @@ static void StreamIntoFunction(ClientContext &context, TableFunctionInput &data,
     // Process chunks and insert rows
     int64_t total_inserted = 0;
     idx_t batch_rows = 0;
+    bool limit_reached = false;
 
-    auto insert_row = [&](unique_ptr<DataChunk> &chunk, idx_t row) {
+    auto insert_row = [&](unique_ptr<DataChunk> &chunk, idx_t row) -> bool {
+        // Check if limit reached before inserting
+        if (bind_data.row_limit > 0 && total_inserted >= bind_data.row_limit) {
+            return false;  // Stop processing
+        }
+
         string insert_sql = "INSERT INTO " + QuoteSqlIdentifier(bind_data.target_table) + " VALUES (";
         for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
             if (col > 0) insert_sql += ", ";
@@ -135,25 +150,39 @@ static void StreamIntoFunction(ClientContext &context, TableFunctionInput &data,
             state.batches_written++;
             batch_rows = 0;
         }
+
+        return true;  // Continue processing
     };
 
     // Process first chunk
     if (first_chunk && first_chunk->size() > 0) {
         for (idx_t row = 0; row < first_chunk->size(); row++) {
-            insert_row(first_chunk, row);
+            if (!insert_row(first_chunk, row)) {
+                limit_reached = true;
+                break;
+            }
         }
     }
 
-    // Process remaining chunks
-    while (auto chunk = query_result->Fetch()) {
-        if (chunk->size() == 0) continue;
+    // Process remaining chunks (unless limit already reached)
+    while (!limit_reached) {
+        auto chunk = query_result->Fetch();
+        if (!chunk || chunk->size() == 0) break;
         for (idx_t row = 0; row < chunk->size(); row++) {
-            insert_row(chunk, row);
+            if (!insert_row(chunk, row)) {
+                limit_reached = true;
+                break;
+            }
         }
     }
 
     state.rows_inserted = total_inserted;
     state.finished = true;
+
+    // Clean up pipeline state
+    if (bind_data.row_limit > 0) {
+        ClearPipelineState(*context.db);
+    }
 
     // Return rows_inserted count
     output.SetValue(0, 0, Value::BIGINT(total_inserted));
@@ -166,7 +195,7 @@ static void StreamIntoFunction(ClientContext &context, TableFunctionInput &data,
 
 void RegisterStreamIntoFunction(ExtensionLoader &loader) {
     TableFunction func("stream_into_internal",
-                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
                        StreamIntoFunction, StreamIntoBind, StreamIntoInitGlobal);
 
     loader.RegisterFunction(func);
