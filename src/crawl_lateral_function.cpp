@@ -122,18 +122,18 @@ static Value BuildHtmlStructValue(const string &body, const string &content_type
         string microdata_json = ExtractMicrodataWithRust(body);
         string schema_json = CombineSchemaData(jsonld_json, microdata_json);
 
-        html_values.push_back(make_pair("body", Value(body)));
+        html_values.push_back(make_pair("document", Value(body)));
         html_values.push_back(make_pair("js", MakeJsonValue(js_json)));
         html_values.push_back(make_pair("opengraph", MakeJsonValue(og_json)));
         html_values.push_back(make_pair("schema", MakeJsonValue(schema_json)));
 #else
-        html_values.push_back(make_pair("body", Value(body)));
+        html_values.push_back(make_pair("document", Value(body)));
         html_values.push_back(make_pair("js", Value(LogicalType::JSON())));
         html_values.push_back(make_pair("opengraph", Value(LogicalType::JSON())));
         html_values.push_back(make_pair("schema", Value(LogicalType::JSON())));
 #endif
     } else {
-        html_values.push_back(make_pair("body", body.empty() ? Value() : Value(body)));
+        html_values.push_back(make_pair("document", body.empty() ? Value() : Value(body)));
         html_values.push_back(make_pair("js", Value(LogicalType::JSON())));
         html_values.push_back(make_pair("opengraph", Value(LogicalType::JSON())));
         html_values.push_back(make_pair("schema", Value(LogicalType::JSON())));
@@ -333,9 +333,9 @@ static unique_ptr<FunctionData> CrawlUrlBind(ClientContext &context, TableFuncti
     return_types.push_back(LogicalType::INTEGER);  // status
     return_types.push_back(LogicalType::VARCHAR);  // content_type
 
-    // html STRUCT(body, js, opengraph, schema) - structured HTML content
+    // html STRUCT(document, js, opengraph, schema) - structured HTML content
     child_list_t<LogicalType> html_struct;
-    html_struct.push_back(make_pair("body", LogicalType::VARCHAR));
+    html_struct.push_back(make_pair("document", LogicalType::VARCHAR));
     html_struct.push_back(make_pair("js", LogicalType::JSON()));        // JSON type
     html_struct.push_back(make_pair("opengraph", LogicalType::JSON())); // JSON type
     html_struct.push_back(make_pair("schema", LogicalType::JSON()));    // Combined JSON-LD + microdata
