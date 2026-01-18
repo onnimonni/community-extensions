@@ -626,7 +626,7 @@ static unique_ptr<FunctionData> CrawlBind(ClientContext &context, TableFunctionB
                                            vector<LogicalType> &return_types, vector<string> &names) {
     auto bind_data = make_uniq<CrawlBindData>();
 
-    // First argument: URL list or query string
+    // First argument: URL list or single URL string
     auto &first_arg = input.inputs[0];
     if (first_arg.type().id() == LogicalTypeId::LIST) {
         auto &url_list = ListValue::GetChildren(first_arg);
@@ -636,7 +636,8 @@ static unique_ptr<FunctionData> CrawlBind(ClientContext &context, TableFunctionB
             }
         }
     } else {
-        bind_data->source_query = StringValue::Get(first_arg);
+        // Single URL string
+        bind_data->urls.push_back(StringValue::Get(first_arg));
     }
 
     // Named parameters
