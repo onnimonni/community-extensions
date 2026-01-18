@@ -35,182 +35,6 @@ namespace duckdb {
 
 using namespace duckdb_yyjson;
 
-//===--------------------------------------------------------------------===//
-// Extraction Spec Parser
-//===--------------------------------------------------------------------===//
-
-CrawlExtractSpec ParseExtractSpec(const string &spec) {
-    CrawlExtractSpec result;
-    result.as_json = false;
-    result.expand_array = false;
-    result.accessor = "text";
-    result.source = "css";
-
-    // Find := separator
-    size_t assign_pos = spec.find(":=");
-    if (assign_pos == string::npos) {
-        throw InvalidInputException("Invalid extract spec '%s': missing ':='", spec);
-    }
-
-    result.name = spec.substr(0, assign_pos);
-    StringUtil::Trim(result.name);
-    string expr = spec.substr(assign_pos + 2);
-    StringUtil::Trim(expr);
-
-    // Check for ::json suffix
-    if (StringUtil::EndsWith(expr, "::json")) {
-        result.as_json = true;
-        expr = expr.substr(0, expr.size() - 6);
-    }
-
-    // Check for [*] array expansion
-    if (StringUtil::EndsWith(expr, "[*]")) {
-        result.expand_array = true;
-        expr = expr.substr(0, expr.size() - 3);
-    }
-
-    // Parse $(...) CSS selector syntax
-    if (expr.size() >= 2 && expr[0] == '$' && expr[1] == '(') {
-        result.source = "css";
-
-        // Find matching )
-        size_t paren_end = expr.rfind(')');
-        if (paren_end == string::npos) {
-            throw InvalidInputException("Invalid CSS selector in '%s': missing closing )", spec);
-        }
-
-        string inner = expr.substr(2, paren_end - 2);
-
-        // Parse arguments: $('selector') or $('selector', 'accessor')
-        bool in_quote = false;
-        char quote_char = 0;
-        size_t comma_pos = string::npos;
-
-        for (size_t i = 0; i < inner.size(); i++) {
-            char c = inner[i];
-            if (!in_quote && (c == '\'' || c == '"')) {
-                in_quote = true;
-                quote_char = c;
-            } else if (in_quote && c == quote_char) {
-                in_quote = false;
-            } else if (!in_quote && c == ',') {
-                comma_pos = i;
-                break;
-            }
-        }
-
-        string selector_part, accessor_part;
-        if (comma_pos != string::npos) {
-            selector_part = inner.substr(0, comma_pos);
-            StringUtil::Trim(selector_part);
-            accessor_part = inner.substr(comma_pos + 1);
-            StringUtil::Trim(accessor_part);
-        } else {
-            selector_part = inner;
-            StringUtil::Trim(selector_part);
-        }
-
-        // Remove quotes from selector
-        if (!selector_part.empty() &&
-            (selector_part[0] == '\'' || selector_part[0] == '"') &&
-            selector_part.back() == selector_part[0]) {
-            result.selector = selector_part.substr(1, selector_part.size() - 2);
-        } else {
-            result.selector = selector_part;
-        }
-
-        // Remove quotes from accessor if present
-        if (!accessor_part.empty()) {
-            if ((accessor_part[0] == '\'' || accessor_part[0] == '"') &&
-                accessor_part.back() == accessor_part[0]) {
-                result.accessor = accessor_part.substr(1, accessor_part.size() - 2);
-            } else {
-                result.accessor = accessor_part;
-            }
-        }
-    }
-    // Parse jsonld.Type.field syntax
-    else if (StringUtil::StartsWith(expr, "jsonld.")) {
-        result.source = "jsonld";
-        result.selector = expr.substr(7);
-    }
-    // Parse opengraph.field or og.field syntax
-    else if (StringUtil::StartsWith(expr, "opengraph.") || StringUtil::StartsWith(expr, "og.")) {
-        result.source = "og";
-        size_t dot = expr.find('.');
-        result.selector = expr.substr(dot + 1);
-    }
-    // Parse meta.field syntax
-    else if (StringUtil::StartsWith(expr, "meta.")) {
-        result.source = "meta";
-        result.selector = expr.substr(5);
-    }
-    // Parse js.variable syntax
-    else if (StringUtil::StartsWith(expr, "js.")) {
-        result.source = "js";
-        result.selector = expr.substr(3);
-    }
-    else {
-        throw InvalidInputException("Unknown extract expression '%s'", expr);
-    }
-
-    return result;
-}
-
-// Build extraction request JSON for Rust
-string BuildRustExtractionRequest(const vector<CrawlExtractSpec> &specs) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
-    if (!doc) return "{}";
-
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
-
-    yyjson_mut_val *specs_arr = yyjson_mut_arr(doc);
-
-    for (const auto &spec : specs) {
-        yyjson_mut_val *spec_obj = yyjson_mut_obj(doc);
-
-        yyjson_mut_obj_add_strcpy(doc, spec_obj, "source", spec.source.c_str());
-        yyjson_mut_obj_add_strcpy(doc, spec_obj, "alias", spec.name.c_str());
-        yyjson_mut_obj_add_bool(doc, spec_obj, "return_text", true);
-        yyjson_mut_obj_add_bool(doc, spec_obj, "is_json_cast", spec.as_json);
-        yyjson_mut_obj_add_bool(doc, spec_obj, "expand_array", spec.expand_array);
-
-        if (spec.source == "css") {
-            yyjson_mut_obj_add_strcpy(doc, spec_obj, "selector", spec.selector.c_str());
-            yyjson_mut_obj_add_strcpy(doc, spec_obj, "accessor", spec.accessor.c_str());
-            yyjson_mut_val *empty_path = yyjson_mut_arr(doc);
-            yyjson_mut_obj_add_val(doc, spec_obj, "path", empty_path);
-        } else {
-            // For jsonld, og, meta, js - parse selector as path
-            yyjson_mut_val *path_arr = yyjson_mut_arr(doc);
-            string remaining = spec.selector;
-            size_t pos;
-            while ((pos = remaining.find('.')) != string::npos) {
-                yyjson_mut_arr_add_strcpy(doc, path_arr, remaining.substr(0, pos).c_str());
-                remaining = remaining.substr(pos + 1);
-            }
-            if (!remaining.empty()) {
-                yyjson_mut_arr_add_strcpy(doc, path_arr, remaining.c_str());
-            }
-            yyjson_mut_obj_add_val(doc, spec_obj, "path", path_arr);
-        }
-
-        yyjson_mut_arr_append(specs_arr, spec_obj);
-    }
-
-    yyjson_mut_obj_add_val(doc, root, "specs", specs_arr);
-
-    size_t len = 0;
-    char *json_str = yyjson_mut_write(doc, 0, &len);
-    yyjson_mut_doc_free(doc);
-
-    if (!json_str) return "{}";
-
-    string result_str(json_str, len);
-    free(json_str);
-    return result_str;
-}
 
 // Build batch crawl request JSON for Rust
 static string BuildBatchCrawlRequest(const vector<string> &urls,
@@ -359,14 +183,14 @@ static vector<CrawlResultEntry> ParseBatchCrawlResponse(const string &response_j
 
 static string CombineSchemaData(const string &jsonld, const string &microdata) {
     // Combine JSON-LD and microdata into a single schema object
-    // Both are JSON objects keyed by @type
+    // Both are JSON objects keyed by @type, with array values
     yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
     if (!doc) return "{}";
 
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    // Parse and merge JSON-LD
+    // Parse and merge JSON-LD (values are arrays)
     if (!jsonld.empty() && jsonld != "{}") {
         yyjson_doc *jld_doc = yyjson_read(jsonld.c_str(), jsonld.size(), 0);
         if (jld_doc) {
@@ -384,7 +208,7 @@ static string CombineSchemaData(const string &jsonld, const string &microdata) {
         }
     }
 
-    // Parse and merge microdata (won't overwrite existing keys from JSON-LD)
+    // Parse and merge microdata (values are arrays, merge with existing)
     if (!microdata.empty() && microdata != "{}") {
         yyjson_doc *md_doc = yyjson_read(microdata.c_str(), microdata.size(), 0);
         if (md_doc) {
@@ -394,8 +218,18 @@ static string CombineSchemaData(const string &jsonld, const string &microdata) {
                 yyjson_val *key, *val;
                 yyjson_obj_foreach(md_root, idx, max, key, val) {
                     const char *key_str = yyjson_get_str(key);
-                    // Only add if not already present from JSON-LD
-                    if (!yyjson_mut_obj_get(root, key_str)) {
+                    yyjson_mut_val *existing = yyjson_mut_obj_get(root, key_str);
+
+                    if (existing && yyjson_mut_is_arr(existing) && yyjson_is_arr(val)) {
+                        // Append microdata items to existing JSON-LD array
+                        size_t arr_idx, arr_max;
+                        yyjson_val *item;
+                        yyjson_arr_foreach(val, arr_idx, arr_max, item) {
+                            yyjson_mut_val *item_copy = yyjson_val_mut_copy(doc, item);
+                            yyjson_mut_arr_append(existing, item_copy);
+                        }
+                    } else if (!existing) {
+                        // Add new type from microdata
                         yyjson_mut_val *key_copy = yyjson_val_mut_copy(doc, key);
                         yyjson_mut_val *val_copy = yyjson_val_mut_copy(doc, val);
                         yyjson_mut_obj_add(root, key_copy, val_copy);
@@ -429,7 +263,53 @@ static Value MakeJsonValue(const string &json_str) {
     return Value(json_str).DefaultCastAs(LogicalType::JSON());
 }
 
-static Value BuildHtmlStructValue(const string &body, const string &content_type) {
+// Helper to create MAP(VARCHAR, JSON) from schema JSON object
+// Converts {"Product": {...}, "Organization": {...}} to MAP with those entries
+static Value MakeSchemaMapValue(const string &schema_json) {
+    auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::JSON());
+
+    if (schema_json.empty() || schema_json == "{}") {
+        return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>());
+    }
+
+    yyjson_doc *doc = yyjson_read(schema_json.c_str(), schema_json.size(), 0);
+    if (!doc) {
+        return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>());
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>());
+    }
+
+    vector<Value> keys;
+    vector<Value> values;
+
+    size_t idx, max;
+    yyjson_val *key, *val;
+    yyjson_obj_foreach(root, idx, max, key, val) {
+        const char *key_str = yyjson_get_str(key);
+        if (key_str) {
+            keys.push_back(Value(key_str));
+
+            // Serialize value back to JSON string
+            size_t len = 0;
+            char *val_str = yyjson_val_write(val, 0, &len);
+            if (val_str) {
+                values.push_back(Value(string(val_str, len)).DefaultCastAs(LogicalType::JSON()));
+                free(val_str);
+            } else {
+                values.push_back(Value(LogicalType::JSON()));
+            }
+        }
+    }
+
+    yyjson_doc_free(doc);
+    return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), keys, values);
+}
+
+static Value BuildHtmlStructValue(const string &body, const string &content_type, const string &url = "") {
     child_list_t<Value> html_values;
 
     bool is_html = content_type.find("text/html") != string::npos ||
@@ -442,23 +322,27 @@ static Value BuildHtmlStructValue(const string &body, const string &content_type
         string jsonld_json = ExtractJsonLdWithRust(body);
         string microdata_json = ExtractMicrodataWithRust(body);
         string schema_json = CombineSchemaData(jsonld_json, microdata_json);
+        string readability_json = ExtractReadabilityWithRust(body, url);
 
         html_values.push_back(make_pair("document", Value(body)));
         html_values.push_back(make_pair("js", MakeJsonValue(js_json)));
         html_values.push_back(make_pair("opengraph", MakeJsonValue(og_json)));
-        html_values.push_back(make_pair("schema", MakeJsonValue(schema_json)));
+        html_values.push_back(make_pair("schema", MakeSchemaMapValue(schema_json)));
+        html_values.push_back(make_pair("readability", MakeJsonValue(readability_json)));
 #else
         html_values.push_back(make_pair("document", Value(body)));
         html_values.push_back(make_pair("js", Value(LogicalType::JSON())));
         html_values.push_back(make_pair("opengraph", Value(LogicalType::JSON())));
-        html_values.push_back(make_pair("schema", Value(LogicalType::JSON())));
+        html_values.push_back(make_pair("schema", Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>())));
+        html_values.push_back(make_pair("readability", Value(LogicalType::JSON())));
 #endif
     } else {
         // Non-HTML content or empty body
         html_values.push_back(make_pair("document", body.empty() ? Value() : Value(body)));
         html_values.push_back(make_pair("js", Value(LogicalType::JSON())));
         html_values.push_back(make_pair("opengraph", Value(LogicalType::JSON())));
-        html_values.push_back(make_pair("schema", Value(LogicalType::JSON())));
+        html_values.push_back(make_pair("schema", Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>())));
+        html_values.push_back(make_pair("readability", Value(LogicalType::JSON())));
     }
 
     return Value::STRUCT(std::move(html_values));
@@ -471,8 +355,6 @@ static Value BuildHtmlStructValue(const string &body, const string &content_type
 struct CrawlBindData : public TableFunctionData {
     vector<string> urls;
     string source_query;
-    vector<CrawlExtractSpec> extract_specs;
-    string extraction_request_json;
     string state_table;
     string user_agent = "DuckDB-Crawler/1.0";
     int timeout_ms = 30000;
@@ -484,6 +366,8 @@ struct CrawlBindData : public TableFunctionData {
     int max_depth = 1;       // Max crawl depth (1 = initial URLs only)
     bool use_cache = true;   // Enable HTTP response caching
     int cache_ttl_hours = 24;  // Cache TTL in hours
+    int64_t max_results = -1;  // Max results to return (-1 = unlimited), for LIMIT pushdown
+    idx_t reported_cardinality = 0;  // Cardinality we report to optimizer (for LIMIT detection)
 };
 
 // URL with depth tracking for link following
@@ -505,6 +389,8 @@ struct CrawlGlobalState : public GlobalTableFunctionState {
     idx_t queue_idx = 0;                       // Next index in url_queue
     bool initialized = false;
     bool finished = false;
+    int64_t results_returned = 0;              // Count of results returned (for max_results)
+    int64_t limit_from_query = -1;             // LIMIT value pushed down from query (-1 = unlimited)
 
     idx_t MaxThreads() const override { return 1; }
 };
@@ -642,15 +528,7 @@ static unique_ptr<FunctionData> CrawlBind(ClientContext &context, TableFunctionB
 
     // Named parameters
     for (auto &kv : input.named_parameters) {
-        if (kv.first == "extract") {
-            auto &spec_list = ListValue::GetChildren(kv.second);
-            for (auto &spec_val : spec_list) {
-                if (!spec_val.IsNull()) {
-                    bind_data->extract_specs.push_back(ParseExtractSpec(StringValue::Get(spec_val)));
-                }
-            }
-            bind_data->extraction_request_json = BuildRustExtractionRequest(bind_data->extract_specs);
-        } else if (kv.first == "state_table") {
+        if (kv.first == "state_table") {
             bind_data->state_table = StringValue::Get(kv.second);
         } else if (kv.first == "user_agent") {
             bind_data->user_agent = StringValue::Get(kv.second);
@@ -673,6 +551,8 @@ static unique_ptr<FunctionData> CrawlBind(ClientContext &context, TableFunctionB
             bind_data->use_cache = kv.second.GetValue<bool>();
         } else if (kv.first == "cache_ttl") {
             bind_data->cache_ttl_hours = kv.second.GetValue<int>();
+        } else if (kv.first == "max_results") {
+            bind_data->max_results = kv.second.GetValue<int64_t>();
         }
     }
 
@@ -686,7 +566,9 @@ static unique_ptr<FunctionData> CrawlBind(ClientContext &context, TableFunctionB
     html_struct.push_back(make_pair("document", LogicalType::VARCHAR)); // Raw HTML document
     html_struct.push_back(make_pair("js", LogicalType::JSON()));        // JSON type
     html_struct.push_back(make_pair("opengraph", LogicalType::JSON())); // JSON type
-    html_struct.push_back(make_pair("schema", LogicalType::JSON()));    // Combined JSON-LD + microdata
+    // schema is MAP(VARCHAR, JSON) for easy access: schema['Product']->>'name'
+    html_struct.push_back(make_pair("schema", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::JSON())));
+    html_struct.push_back(make_pair("readability", LogicalType::JSON()));  // Readability extracted content
     return_types.push_back(LogicalType::STRUCT(html_struct));
 
     return_types.push_back(LogicalType::VARCHAR);  // error
@@ -707,12 +589,36 @@ static unique_ptr<FunctionData> CrawlBind(ClientContext &context, TableFunctionB
 }
 
 //===--------------------------------------------------------------------===//
+// Cardinality Function (for LIMIT pushdown detection)
+//===--------------------------------------------------------------------===//
+
+// We report a large cardinality so LIMIT pushdown can be detected by comparing
+// estimated_cardinality (after optimizer) with our reported value
+static constexpr idx_t CRAWL_REPORTED_CARDINALITY = 1000000;
+
+static unique_ptr<NodeStatistics> CrawlCardinality(ClientContext &context, const FunctionData *bind_data) {
+    return make_uniq<NodeStatistics>(CRAWL_REPORTED_CARDINALITY, CRAWL_REPORTED_CARDINALITY);
+}
+
+//===--------------------------------------------------------------------===//
 // Init Global
 //===--------------------------------------------------------------------===//
 
 static unique_ptr<GlobalTableFunctionState> CrawlInitGlobal(ClientContext &context,
                                                              TableFunctionInitInput &input) {
-    return make_uniq<CrawlGlobalState>();
+    auto state = make_uniq<CrawlGlobalState>();
+
+    // LIMIT pushdown: compare estimated_cardinality with our reported cardinality
+    // If estimated < reported, LIMIT was applied by the optimizer
+    if (input.op) {
+        idx_t estimated = input.op->estimated_cardinality;
+        // If estimated is less than our reported cardinality, LIMIT was applied
+        if (estimated > 0 && estimated < CRAWL_REPORTED_CARDINALITY) {
+            state->limit_from_query = static_cast<int64_t>(estimated);
+        }
+    }
+
+    return std::move(state);
 }
 
 //===--------------------------------------------------------------------===//
@@ -767,26 +673,39 @@ static void CrawlFunction(ClientContext &context, TableFunctionInput &data, Data
 
     idx_t count = 0;
 
-    while (count < STANDARD_VECTOR_SIZE) {
+    // For LIMIT pushdown: yield ONE row at a time, then return to let executor decide
+    // This allows LIMIT to take effect between HTTP requests
+    while (count < 1) {  // Changed from STANDARD_VECTOR_SIZE to 1 for streaming
         // Check for interrupt (Ctrl+C)
         if (IsInterrupted()) {
             state.finished = true;
             break;
         }
 
-        // If we have pending results, yield them
+        // Check max_results limit (explicit param takes precedence over LIMIT pushdown)
+        int64_t effective_limit = bind_data.max_results;
+        if (effective_limit < 0 && state.limit_from_query >= 0) {
+            effective_limit = state.limit_from_query;
+        }
+        if (effective_limit >= 0 && state.results_returned >= effective_limit) {
+            state.finished = true;
+            break;
+        }
+
+        // If we have pending results, yield ONE
         if (state.result_idx < state.pending_results.size()) {
             auto &entry = state.pending_results[state.result_idx++];
 
             output.SetValue(0, count, Value(entry.url));
             output.SetValue(1, count, Value(entry.status_code));
             output.SetValue(2, count, Value(entry.content_type));
-            output.SetValue(3, count, BuildHtmlStructValue(entry.body, entry.content_type));
+            output.SetValue(3, count, BuildHtmlStructValue(entry.body, entry.content_type, entry.url));
             output.SetValue(4, count, entry.error.empty() ? Value() : Value(entry.error));
             output.SetValue(5, count, entry.extracted_json.empty() ? Value() : Value(entry.extracted_json));
             output.SetValue(6, count, Value::BIGINT(entry.response_time_ms));
             output.SetValue(7, count, Value::INTEGER(entry.depth));
             count++;
+            state.results_returned++;  // Track for max_results limit
 
             // Mark as processed (before extracting links to avoid re-queuing)
             state.processed_urls.insert(entry.url);
@@ -807,99 +726,74 @@ static void CrawlFunction(ClientContext &context, TableFunctionInput &data, Data
             if (conn) {
                 SaveToStateTable(*conn, bind_data.state_table, entry);
             }
-            continue;
+            break;  // Return after ONE row to allow LIMIT to interrupt
         }
 
-        // No more pending results - fetch next batch
+        // No more pending results - fetch ONE URL at a time for LIMIT pushdown
         state.pending_results.clear();
         state.result_idx = 0;
 
-        // Collect next batch of URLs from queue (skip already processed)
-        vector<string> batch_urls;
-        vector<int> batch_depths;
-        while (batch_urls.size() < (size_t)bind_data.batch_size &&
-               state.queue_idx < state.url_queue.size()) {
+        // Get next single URL from queue (skip already processed)
+        string url_to_fetch;
+        int url_depth = 1;
+        while (state.queue_idx < state.url_queue.size()) {
             auto &item = state.url_queue[state.queue_idx++];
             // Skip if already processed (handles duplicates and resumption from state table)
             if (state.processed_urls.count(item.url) == 0) {
-                batch_urls.push_back(item.url);
-                batch_depths.push_back(item.depth);
+                url_to_fetch = item.url;
+                url_depth = item.depth;
+                break;
             }
         }
 
         // No more URLs to fetch
-        if (batch_urls.empty()) {
+        if (url_to_fetch.empty()) {
             state.finished = true;
             break;
         }
 
         Connection cache_conn(*context.db);
 
-        // Check cache for already-fetched URLs (if caching enabled)
-        vector<CrawlResultEntry> cached_entries;
-        vector<string> uncached_urls;
-        vector<int> uncached_depths;
-        std::map<string, int> url_to_depth;
-
-        for (size_t i = 0; i < batch_urls.size(); i++) {
-            url_to_depth[batch_urls[i]] = batch_depths[i];
-        }
+        // Check cache first
+        CrawlResultEntry result;
+        bool from_cache = false;
 
         if (bind_data.use_cache) {
-            cached_entries = GetCachedEntries(cache_conn, batch_urls, bind_data.cache_ttl_hours);
-
-            // Build set of cached URLs and set depth
-            std::set<string> cached_url_set;
-            for (auto &entry : cached_entries) {
-                cached_url_set.insert(entry.url);
-                entry.depth = url_to_depth[entry.url];
+            auto cached = GetCachedEntries(cache_conn, {url_to_fetch}, bind_data.cache_ttl_hours);
+            if (!cached.empty()) {
+                result = std::move(cached[0]);
+                result.depth = url_depth;
+                from_cache = true;
             }
-
-            // Collect uncached URLs
-            for (size_t i = 0; i < batch_urls.size(); i++) {
-                if (cached_url_set.count(batch_urls[i]) == 0) {
-                    uncached_urls.push_back(batch_urls[i]);
-                    uncached_depths.push_back(batch_depths[i]);
-                }
-            }
-        } else {
-            uncached_urls = batch_urls;
-            uncached_depths = batch_depths;
         }
 
-        // Fetch uncached URLs from Rust
-        vector<CrawlResultEntry> fetched_results;
-        if (!uncached_urls.empty()) {
+        // Fetch if not cached
+        if (!from_cache) {
             string request_json = BuildBatchCrawlRequest(
-                uncached_urls,
-                bind_data.extraction_request_json,
+                {url_to_fetch},
+                "{}",  // No extraction specs
                 bind_data.user_agent,
                 bind_data.timeout_ms,
-                bind_data.concurrency,
+                1,  // Single URL, single concurrency
                 bind_data.delay_ms,
                 bind_data.respect_robots
             );
 
             string response_json = CrawlBatchWithRust(request_json);
-            fetched_results = ParseBatchCrawlResponse(response_json);
+            auto fetched = ParseBatchCrawlResponse(response_json);
 
-            // Set depth and save to cache
-            for (size_t i = 0; i < fetched_results.size() && i < uncached_depths.size(); i++) {
-                fetched_results[i].depth = uncached_depths[i];
+            if (!fetched.empty()) {
+                result = std::move(fetched[0]);
+                result.depth = url_depth;
+
                 if (bind_data.use_cache) {
-                    SaveToCache(cache_conn, fetched_results[i]);
+                    SaveToCache(cache_conn, result);
                 }
             }
         }
 
-        // Combine cached + fetched results
-        state.pending_results.clear();
-        for (auto &entry : cached_entries) {
-            state.pending_results.push_back(std::move(entry));
-        }
-        for (auto &entry : fetched_results) {
-            state.pending_results.push_back(std::move(entry));
-        }
+        // Add to pending results for immediate yield
+        state.pending_results.push_back(std::move(result));
     }
 
     output.SetCardinality(count);
@@ -955,17 +849,6 @@ static OperatorResultType CrawlInOut(ExecutionContext &context, TableFunctionInp
         yyjson_mut_val *urls_arr = yyjson_mut_arr(doc);
         yyjson_mut_arr_add_strcpy(doc, urls_arr, url.c_str());
         yyjson_mut_obj_add_val(doc, root, "urls", urls_arr);
-
-        if (!bind_data.extraction_request_json.empty() && bind_data.extraction_request_json != "{}") {
-            yyjson_doc *ext_doc = yyjson_read(bind_data.extraction_request_json.c_str(),
-                                               bind_data.extraction_request_json.size(), 0);
-            if (ext_doc) {
-                yyjson_val *ext_root = yyjson_doc_get_root(ext_doc);
-                yyjson_mut_val *ext_copy = yyjson_val_mut_copy(doc, ext_root);
-                yyjson_mut_obj_add_val(doc, root, "extraction", ext_copy);
-                yyjson_doc_free(ext_doc);
-            }
-        }
 
         yyjson_mut_obj_add_strcpy(doc, root, "user_agent", bind_data.user_agent.c_str());
         yyjson_mut_obj_add_uint(doc, root, "timeout_ms", bind_data.timeout_ms);
@@ -1039,7 +922,7 @@ static OperatorResultType CrawlInOut(ExecutionContext &context, TableFunctionInp
             output.SetValue(0, count, Value(result_url));
             output.SetValue(1, count, Value(status));
             output.SetValue(2, count, Value(content_type));
-            output.SetValue(3, count, BuildHtmlStructValue(body, content_type));
+            output.SetValue(3, count, BuildHtmlStructValue(body, content_type, result_url));
             output.SetValue(4, count, error.empty() ? Value() : Value(error));
             output.SetValue(5, count, extracted_json.empty() ? Value() : Value(extracted_json));
             output.SetValue(6, count, Value::BIGINT(response_time));
@@ -1047,7 +930,7 @@ static OperatorResultType CrawlInOut(ExecutionContext &context, TableFunctionInp
             output.SetValue(0, count, Value(url));
             output.SetValue(1, count, Value());
             output.SetValue(2, count, Value());
-            output.SetValue(3, count, BuildHtmlStructValue("", ""));
+            output.SetValue(3, count, BuildHtmlStructValue("", "", url));
             output.SetValue(4, count, Value("No results"));
             output.SetValue(5, count, Value());
             output.SetValue(6, count, Value());
@@ -1080,18 +963,21 @@ void RegisterCrawlTableFunction(ExtensionLoader &loader) {
         func.named_parameters["max_depth"] = LogicalType::INTEGER;
         func.named_parameters["cache"] = LogicalType::BOOLEAN;
         func.named_parameters["cache_ttl"] = LogicalType::INTEGER;
+        func.named_parameters["max_results"] = LogicalType::BIGINT;
     };
 
     // crawl() with URL list (batch mode)
     TableFunction list_func("crawl",
                             {LogicalType::LIST(LogicalType::VARCHAR)},
                             CrawlFunction, CrawlBind, CrawlInitGlobal);
+    list_func.cardinality = CrawlCardinality;  // Enable LIMIT pushdown detection
     add_params(list_func);
 
     // crawl() with single URL (also batch mode, no LATERAL)
     TableFunction single_func("crawl",
                               {LogicalType::VARCHAR},
                               CrawlFunction, CrawlBind, CrawlInitGlobal);
+    single_func.cardinality = CrawlCardinality;  // Enable LIMIT pushdown detection
     add_params(single_func);
 
     TableFunctionSet crawl_set("crawl");

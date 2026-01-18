@@ -150,13 +150,15 @@ static void SaveToCache(Connection &conn, const SingleCrawlResult &result) {
 //===--------------------------------------------------------------------===//
 
 static string CombineSchemaData(const string &jsonld, const string &microdata) {
+    // Combine JSON-LD and microdata into a single schema object
+    // Both are JSON objects keyed by @type, with array values
     yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
     if (!doc) return "{}";
 
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    // Parse and merge JSON-LD
+    // Parse and merge JSON-LD (values are arrays)
     if (!jsonld.empty() && jsonld != "{}") {
         yyjson_doc *jld_doc = yyjson_read(jsonld.c_str(), jsonld.size(), 0);
         if (jld_doc) {
@@ -174,7 +176,7 @@ static string CombineSchemaData(const string &jsonld, const string &microdata) {
         }
     }
 
-    // Parse and merge microdata
+    // Parse and merge microdata (values are arrays, merge with existing)
     if (!microdata.empty() && microdata != "{}") {
         yyjson_doc *md_doc = yyjson_read(microdata.c_str(), microdata.size(), 0);
         if (md_doc) {
@@ -184,7 +186,18 @@ static string CombineSchemaData(const string &jsonld, const string &microdata) {
                 yyjson_val *key, *val;
                 yyjson_obj_foreach(md_root, idx, max, key, val) {
                     const char *key_str = yyjson_get_str(key);
-                    if (!yyjson_mut_obj_get(root, key_str)) {
+                    yyjson_mut_val *existing = yyjson_mut_obj_get(root, key_str);
+
+                    if (existing && yyjson_mut_is_arr(existing) && yyjson_is_arr(val)) {
+                        // Append microdata items to existing JSON-LD array
+                        size_t arr_idx, arr_max;
+                        yyjson_val *item;
+                        yyjson_arr_foreach(val, arr_idx, arr_max, item) {
+                            yyjson_mut_val *item_copy = yyjson_val_mut_copy(doc, item);
+                            yyjson_mut_arr_append(existing, item_copy);
+                        }
+                    } else if (!existing) {
+                        // Add new type from microdata
                         yyjson_mut_val *key_copy = yyjson_val_mut_copy(doc, key);
                         yyjson_mut_val *val_copy = yyjson_val_mut_copy(doc, val);
                         yyjson_mut_obj_add(root, key_copy, val_copy);
@@ -217,7 +230,57 @@ static Value MakeJsonValue(const string &json_str) {
     return Value(json_str).DefaultCastAs(LogicalType::JSON());
 }
 
-static Value BuildHtmlStructValue(const string &body, const string &content_type) {
+// Helper to create MAP(VARCHAR, JSON) from schema JSON object
+static Value MakeSchemaMapValue(const string &schema_json) {
+    auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::JSON());
+
+    if (schema_json.empty() || schema_json == "{}") {
+        return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>());
+    }
+
+    yyjson_doc *doc = yyjson_read(schema_json.c_str(), schema_json.size(), 0);
+    if (!doc) {
+        return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>());
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>());
+    }
+
+    vector<Value> keys;
+    vector<Value> values;
+
+    size_t idx, max;
+    yyjson_val *key, *val;
+    yyjson_obj_foreach(root, idx, max, key, val) {
+        const char *key_str = yyjson_get_str(key);
+        if (key_str) {
+            keys.push_back(Value(key_str));
+
+            // Serialize value back to JSON string
+            size_t len = 0;
+            char *val_str = yyjson_val_write(val, 0, &len);
+            if (val_str) {
+                values.push_back(Value(string(val_str, len)).DefaultCastAs(LogicalType::JSON()));
+                free(val_str);
+            } else {
+                values.push_back(Value(LogicalType::JSON()));
+            }
+        }
+    }
+
+    yyjson_doc_free(doc);
+
+    if (keys.empty()) {
+        return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>());
+    }
+
+    return Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), keys, values);
+}
+
+static Value BuildHtmlStructValue(const string &body, const string &content_type, const string &url = "") {
     child_list_t<Value> html_values;
 
     bool is_html = content_type.find("text/html") != string::npos ||
@@ -230,22 +293,26 @@ static Value BuildHtmlStructValue(const string &body, const string &content_type
         string jsonld_json = ExtractJsonLdWithRust(body);
         string microdata_json = ExtractMicrodataWithRust(body);
         string schema_json = CombineSchemaData(jsonld_json, microdata_json);
+        string readability_json = ExtractReadabilityWithRust(body, url);
 
         html_values.push_back(make_pair("document", Value(body)));
         html_values.push_back(make_pair("js", MakeJsonValue(js_json)));
         html_values.push_back(make_pair("opengraph", MakeJsonValue(og_json)));
-        html_values.push_back(make_pair("schema", MakeJsonValue(schema_json)));
+        html_values.push_back(make_pair("schema", MakeSchemaMapValue(schema_json)));
+        html_values.push_back(make_pair("readability", MakeJsonValue(readability_json)));
 #else
         html_values.push_back(make_pair("document", Value(body)));
         html_values.push_back(make_pair("js", Value(LogicalType::JSON())));
         html_values.push_back(make_pair("opengraph", Value(LogicalType::JSON())));
-        html_values.push_back(make_pair("schema", Value(LogicalType::JSON())));
+        html_values.push_back(make_pair("schema", Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>())));
+        html_values.push_back(make_pair("readability", Value(LogicalType::JSON())));
 #endif
     } else {
         html_values.push_back(make_pair("document", body.empty() ? Value() : Value(body)));
         html_values.push_back(make_pair("js", Value(LogicalType::JSON())));
         html_values.push_back(make_pair("opengraph", Value(LogicalType::JSON())));
-        html_values.push_back(make_pair("schema", Value(LogicalType::JSON())));
+        html_values.push_back(make_pair("schema", Value::MAP(LogicalType::VARCHAR, LogicalType::JSON(), vector<Value>(), vector<Value>())));
+        html_values.push_back(make_pair("readability", Value(LogicalType::JSON())));
     }
 
     return Value::STRUCT(std::move(html_values));
@@ -256,8 +323,6 @@ static Value BuildHtmlStructValue(const string &body, const string &content_type
 //===--------------------------------------------------------------------===//
 
 struct CrawlUrlBindData : public TableFunctionData {
-    vector<CrawlExtractSpec> extract_specs;
-    string extraction_request_json;
     string user_agent = "DuckDB-Crawler/1.0";
     int timeout_ms = 30000;
     bool use_cache = true;      // Enable HTTP response caching
@@ -434,15 +499,7 @@ static unique_ptr<FunctionData> CrawlUrlBind(ClientContext &context, TableFuncti
 
     // Named parameters
     for (auto &kv : input.named_parameters) {
-        if (kv.first == "extract") {
-            auto &spec_list = ListValue::GetChildren(kv.second);
-            for (auto &spec_val : spec_list) {
-                if (!spec_val.IsNull()) {
-                    bind_data->extract_specs.push_back(ParseExtractSpec(StringValue::Get(spec_val)));
-                }
-            }
-            bind_data->extraction_request_json = BuildRustExtractionRequest(bind_data->extract_specs);
-        } else if (kv.first == "user_agent") {
+        if (kv.first == "user_agent") {
             bind_data->user_agent = StringValue::Get(kv.second);
         } else if (kv.first == "timeout") {
             bind_data->timeout_ms = kv.second.GetValue<int>() * 1000;
@@ -460,12 +517,13 @@ static unique_ptr<FunctionData> CrawlUrlBind(ClientContext &context, TableFuncti
     return_types.push_back(LogicalType::INTEGER);  // status
     return_types.push_back(LogicalType::VARCHAR);  // content_type
 
-    // html STRUCT(document, js, opengraph, schema) - structured HTML content
+    // html STRUCT(document, js, opengraph, schema, readability) - structured HTML content
     child_list_t<LogicalType> html_struct;
     html_struct.push_back(make_pair("document", LogicalType::VARCHAR));
     html_struct.push_back(make_pair("js", LogicalType::JSON()));        // JSON type
     html_struct.push_back(make_pair("opengraph", LogicalType::JSON())); // JSON type
-    html_struct.push_back(make_pair("schema", LogicalType::JSON()));    // Combined JSON-LD + microdata
+    html_struct.push_back(make_pair("schema", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::JSON())));  // MAP for schema['Product'] access
+    html_struct.push_back(make_pair("readability", LogicalType::JSON()));  // Readability extracted content
     return_types.push_back(LogicalType::STRUCT(html_struct));
 
     return_types.push_back(LogicalType::VARCHAR);  // error
@@ -556,7 +614,7 @@ static OperatorResultType CrawlUrlInOut(ExecutionContext &context, TableFunction
             output.SetValue(0, 0, Value());
             output.SetValue(1, 0, Value());
             output.SetValue(2, 0, Value());
-            output.SetValue(3, 0, BuildHtmlStructValue("", ""));
+            output.SetValue(3, 0, BuildHtmlStructValue("", "", ""));
             output.SetValue(4, 0, Value("NULL URL"));
             output.SetValue(5, 0, Value());
             output.SetValue(6, 0, Value());
@@ -603,7 +661,7 @@ static OperatorResultType CrawlUrlInOut(ExecutionContext &context, TableFunction
 
         // Crawl if not in cache
         if (!from_cache) {
-            result = CrawlSingleUrl(url, bind_data.extraction_request_json,
+            result = CrawlSingleUrl(url, "{}",  // No extraction specs
                                     bind_data.user_agent, bind_data.timeout_ms);
 
             // Save to cache
@@ -617,7 +675,7 @@ static OperatorResultType CrawlUrlInOut(ExecutionContext &context, TableFunction
         output.SetValue(0, 0, Value(result.url));
         output.SetValue(1, 0, Value(result.status_code));
         output.SetValue(2, 0, Value(result.content_type));
-        output.SetValue(3, 0, BuildHtmlStructValue(result.body, result.content_type));
+        output.SetValue(3, 0, BuildHtmlStructValue(result.body, result.content_type, result.url));
         output.SetValue(4, 0, result.error.empty() ? Value() : Value(result.error));
         output.SetValue(5, 0, result.extracted_json.empty() ? Value() : Value(result.extracted_json));
         output.SetValue(6, 0, Value::BIGINT(result.response_time_ms));

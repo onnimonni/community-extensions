@@ -247,22 +247,28 @@ fn extract_single(
 }
 
 /// Extract JSON-LD objects from script tags, keyed by @type
+/// Returns HashMap where each value is a JSON array of items with that type
 pub fn extract_jsonld_objects(document: &Html) -> HashMap<String, Value> {
-    let mut result = HashMap::new();
+    let mut collected: HashMap<String, Vec<Value>> = HashMap::new();
     let selector = Selector::parse(r#"script[type="application/ld+json"]"#).unwrap();
 
     for element in document.select(&selector) {
         let text = element.text().collect::<String>();
         if let Ok(json) = serde_json::from_str::<Value>(&text) {
-            collect_typed_objects(&json, &mut result);
+            collect_typed_objects(&json, &mut collected);
         }
     }
 
-    result
+    // Convert Vec<Value> to Value::Array for each type
+    collected
+        .into_iter()
+        .map(|(k, v)| (k, Value::Array(v)))
+        .collect()
 }
 
 /// Recursively collect objects with @type, including from @graph
-fn collect_typed_objects(value: &Value, result: &mut HashMap<String, Value>) {
+/// Each type maps to an array of items (even if only one item)
+fn collect_typed_objects(value: &Value, result: &mut HashMap<String, Vec<Value>>) {
     match value {
         Value::Object(obj) => {
             // Check for @graph array
@@ -290,7 +296,8 @@ fn collect_typed_objects(value: &Value, result: &mut HashMap<String, Value>) {
                         .or_else(|| t.strip_prefix("http://schema.org/"))
                         .unwrap_or(&t)
                         .to_string();
-                    result.insert(clean_type, value.clone());
+                    // Push to array instead of overwriting
+                    result.entry(clean_type).or_default().push(value.clone());
                 }
             }
         }
@@ -304,6 +311,7 @@ fn collect_typed_objects(value: &Value, result: &mut HashMap<String, Value>) {
 }
 
 /// Navigate JSON-LD data by path
+/// Data values are arrays, so we get the first item of the type's array
 fn extract_from_jsonld(
     data: &HashMap<String, Value>,
     path: &[String],
@@ -315,7 +323,10 @@ fn extract_from_jsonld(
 
     // First segment is the @type
     let type_name = &path[0];
-    let obj = data.get(type_name)?;
+    let arr = data.get(type_name)?;
+
+    // Get first item from array (values are always arrays now)
+    let obj = arr.as_array()?.first()?;
 
     // Navigate remaining path
     let mut current = obj;
@@ -326,9 +337,10 @@ fn extract_from_jsonld(
     value_to_string(current, return_text)
 }
 
-/// Extract microdata from HTML
+/// Extract microdata from HTML, keyed by itemtype
+/// Returns HashMap where each value is a JSON array of items with that type
 pub fn extract_microdata(document: &Html) -> HashMap<String, Value> {
-    let mut result = HashMap::new();
+    let mut collected: HashMap<String, Vec<Value>> = HashMap::new();
     let selector = Selector::parse("[itemscope][itemtype]").unwrap();
 
     for element in document.select(&selector) {
@@ -358,14 +370,20 @@ pub fn extract_microdata(document: &Html) -> HashMap<String, Value> {
                 }
             }
 
-            result.insert(type_name, Value::Object(props));
+            // Push to array instead of overwriting
+            collected.entry(type_name).or_default().push(Value::Object(props));
         }
     }
 
-    result
+    // Convert Vec<Value> to Value::Array for each type
+    collected
+        .into_iter()
+        .map(|(k, v)| (k, Value::Array(v)))
+        .collect()
 }
 
 /// Navigate microdata by path
+/// Data values are arrays, so we get the first item of the type's array
 fn extract_from_microdata(
     data: &HashMap<String, Value>,
     path: &[String],
@@ -376,7 +394,10 @@ fn extract_from_microdata(
     }
 
     let type_name = &path[0];
-    let obj = data.get(type_name)?;
+    let arr = data.get(type_name)?;
+
+    // Get first item from array (values are always arrays now)
+    let obj = arr.as_array()?.first()?;
 
     let mut current = obj;
     for segment in path.iter().skip(1) {
@@ -435,6 +456,49 @@ fn extract_from_meta(data: &HashMap<String, String>, path: &[String]) -> Option<
         return None;
     }
     data.get(&path[0]).cloned()
+}
+
+/// Readability extraction result
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReadabilityResult {
+    pub title: String,
+    pub content: String,      // HTML content
+    pub text_content: String, // Plain text content
+    pub length: usize,        // Character count of text
+    pub excerpt: String,      // Short excerpt/summary
+}
+
+/// Extract article content using readability algorithm
+pub fn extract_readability(html: &str, url: &str) -> ReadabilityResult {
+    use readability::extractor;
+    use std::io::Cursor;
+    use url::Url;
+
+    // Parse URL, default to a placeholder if invalid
+    let parsed_url = match Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => match Url::parse("http://example.com") {
+            Ok(u) => u,
+            Err(_) => return ReadabilityResult::default(),
+        },
+    };
+
+    let mut cursor = Cursor::new(html.as_bytes());
+    match extractor::extract(&mut cursor, &parsed_url) {
+        Ok(product) => {
+            let text_len = product.text.len();
+            let excerpt = product.text.chars().take(200).collect::<String>()
+                + if text_len > 200 { "..." } else { "" };
+            ReadabilityResult {
+                title: product.title,
+                content: product.content,
+                length: text_len,
+                excerpt,
+                text_content: product.text,
+            }
+        }
+        Err(_) => ReadabilityResult::default(),
+    }
 }
 
 /// Extract using CSS selector

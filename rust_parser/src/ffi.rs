@@ -255,6 +255,47 @@ pub unsafe extern "C" fn extract_js_ffi(
     }
 }
 
+/// Extract article content using readability algorithm
+#[no_mangle]
+pub unsafe extern "C" fn extract_readability_ffi(
+    html_ptr: *const c_char,
+    html_len: usize,
+    url_ptr: *const c_char,
+) -> ExtractionResultFFI {
+    let html = match std::str::from_utf8(std::slice::from_raw_parts(html_ptr as *const u8, html_len)) {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid UTF-8: {}", e)),
+            };
+        }
+    };
+
+    let url = match CStr::from_ptr(url_ptr).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            return ExtractionResultFFI {
+                json_ptr: ptr::null_mut(),
+                error_ptr: string_to_ptr(format!("Invalid URL: {}", e)),
+            };
+        }
+    };
+
+    let result = crate::extractors::extract_readability(html, url);
+
+    match serde_json::to_string(&result) {
+        Ok(json) => ExtractionResultFFI {
+            json_ptr: string_to_ptr(json),
+            error_ptr: ptr::null_mut(),
+        },
+        Err(e) => ExtractionResultFFI {
+            json_ptr: ptr::null_mut(),
+            error_ptr: string_to_ptr(format!("Serialization error: {}", e)),
+        },
+    }
+}
+
 /// Extract elements matching CSS selector
 #[no_mangle]
 pub unsafe extern "C" fn extract_css_ffi(

@@ -2,31 +2,12 @@
 
 #include <string>
 #include <vector>
-#include "crawl_parser.hpp"
 
 namespace duckdb {
-
-// Build JSON request from ExtractSpecs for Rust FFI
-std::string BuildExtractionRequest(const std::vector<ExtractSpec> &specs);
 
 // Call Rust parser to extract data from HTML
 // Returns JSON string with extracted values
 std::string ExtractWithRust(const std::string &html, const std::string &request_json);
-
-// Parse Rust extraction result JSON into value vector
-std::vector<std::string> ParseExtractionResult(const std::string &result_json,
-                                                const std::vector<ExtractSpec> &specs);
-
-// Expanded extraction result for array expansion
-struct ExpandedExtractionResult {
-	std::vector<std::string> values;  // Regular values (one per spec)
-	std::vector<std::vector<std::string>> expanded;  // Expanded arrays (one per spec, empty if not expanded)
-	bool has_expansion;  // True if any spec has expand_array=true and returned multiple values
-};
-
-// Parse Rust extraction result with support for expanded arrays
-ExpandedExtractionResult ParseExtractionResultExpanded(const std::string &result_json,
-                                                        const std::vector<ExtractSpec> &specs);
 
 // Check if Rust parser is available
 bool IsRustParserAvailable();
@@ -40,6 +21,10 @@ std::string ExtractMicrodataWithRust(const std::string &html);
 std::string ExtractOpenGraphWithRust(const std::string &html);
 std::string ExtractJsWithRust(const std::string &html);
 std::string ExtractCssWithRust(const std::string &html, const std::string &selector);
+
+// Extract article content using readability algorithm
+// Returns JSON: {"title": "...", "content": "<html>", "text_content": "...", "length": 123, "excerpt": "..."}
+std::string ExtractReadabilityWithRust(const std::string &html, const std::string &url);
 
 // Batch crawl + extract (HTTP done in Rust)
 // Takes JSON request: {"urls": [...], "extraction": {...}, "user_agent": "...", "timeout_ms": 30000, "concurrency": 4}

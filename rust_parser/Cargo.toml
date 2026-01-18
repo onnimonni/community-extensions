@@ -25,6 +25,8 @@ url = "2.5"
 # Robots.txt and sitemap parsing
 texting_robots = "0.2"  # robots.txt parser
 quick-xml = "0.37"      # XML sitemap parser
+# Readability - extract article content from HTML
+readability = "0.3"
 
 [profile.release]
 lto = true
